@@ -18,6 +18,8 @@
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2016      IBM Corporation.  All rights reserved.
  * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2025      Barcelona Supercomputing Center (BSC-CNS).
+ *                         All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -85,6 +87,7 @@ prte_ras_base_module_t prte_ras_slurm_module = {
 static int prte_ras_slurm_discover(char *regexp, char *tasks_per_node, pmix_list_t *nodelist);
 static int prte_ras_slurm_parse_ranges(char *base, char *ranges, char ***nodelist);
 static int prte_ras_slurm_parse_range(char *base, char *range, char ***nodelist);
+static int prte_ras_slurm_find_quotes(const char *str_in, const char **start_quote, const char **end_quote);
 
 static bool check_taint(char *name, char *evar)
 {
@@ -227,6 +230,15 @@ static void deallocate(prte_job_t *jdata, prte_app_context_t *app)
 
 static void modify(prte_pmix_server_req_t *req)
 {
+    char *slurm_jobid;
+
+    if (NULL == (slurm_jobid = getenv("SLURM_JOBID"))) {
+        req->pstatus = PMIX_ERROR;
+        return;
+    }
+
+    
+
     req->status = PMIX_ERR_NOT_SUPPORTED;
     return;
 }
@@ -596,4 +608,85 @@ static int prte_ras_slurm_parse_range(char *base, char *range, char ***names)
 
     /* All done */
     return PRTE_SUCCESS;
+}
+
+/*
+ * Parse a null-terminated or line-break terminated input text
+ * and find the first entry deliminated by a pair of unescaped 
+ * quotes inside it.
+ * 
+ * @param str_in         Input text
+ * @param **start_quote  Pointer to populate with start quote address
+ * @param **end_quote    Pointer to populate with end quote address
+ */
+static int prte_ras_slurm_find_entry(const char *str_in, const char **start_entry, const char **end_entry)
+{
+    if(!str_in || !start_quote || !end_quote) {
+        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    bool start_quote_found = false;
+    int backslash_count = 0;
+
+    while('\0' != *str_in && '\n' != *str_in) {
+        /* Even number of backslashes --> unescaped */
+        if('\"' == *str_in && 0 == backslash_count % 2) {
+            if(!start_quote_found) {
+                *start_entry = str_in;
+                start_quote_found = true;
+                backslash_count = 0;
+            }
+            else
+            {
+                *end_entry = str_in;
+                return PRTE_SUCCESS;
+            }
+        } else if ('\\' == *str_in) {
+            backslash_count++;
+        } else {
+            backslash_count = 0;
+        }
+        str_in++;
+    }
+
+    return PRTE_ERR_NOT_FOUND;
+}
+
+static int prte_ras_slurm_find_fields(pmix_list_t *fields)
+{
+    char *slurm_jobid;
+    if (NULL == (slurm_jobid = getenv("SLURM_JOBID"))) {
+        PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
+        return PRTE_ERR_NOT_FOUND;
+    }
+
+    char fields[][]
+    {
+        {"account"},
+        {"partition"},
+        {"qos"},
+    };
+
+    pmix_kval_t *kv;
+    pmix_hash_table_t table;
+
+    PMIX_CONSTRUCT(&table, pmix_hash_table_t);
+
+    pmix_hash_table_init(&table, sizeof(fields));
+
+    PMIX_CONSTRUCT(fields, pmix_list_t);
+
+    size_t fields_len = sizeof(fields) / sizeof(fields[0]);
+
+    for(size_t i = 0; i < fields_len; i++)
+    {
+        /* todo: exclude fields based on MCA params */
+
+        kv = PMIX_NEW(pmix_kval_t);
+        kv->key = strdup(fields[i]);
+        kv->value = NULL;
+        pmix_hash_table_set_value_ptr(&table, kv->key,
+                              strlen(kv->key), kv);
+    }
 }
