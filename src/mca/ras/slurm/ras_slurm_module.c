@@ -87,7 +87,7 @@ prte_ras_base_module_t prte_ras_slurm_module = {
 static int prte_ras_slurm_discover(char *regexp, char *tasks_per_node, pmix_list_t *nodelist);
 static int prte_ras_slurm_parse_ranges(char *base, char *ranges, char ***nodelist);
 static int prte_ras_slurm_parse_range(char *base, char *range, char ***nodelist);
-static int prte_ras_slurm_find_quotes(const char *str_in, const char **start_quote, const char **end_quote);
+static int prte_ras_slurm_find_next_quoted(const char *str_in, const char **start_entry, const char **end_entry);
 
 static bool check_taint(char *name, char *evar)
 {
@@ -611,17 +611,17 @@ static int prte_ras_slurm_parse_range(char *base, char *range, char ***names)
 }
 
 /*
- * Parse a null-terminated or line-break terminated input text
- * and find the first entry deliminated by a pair of unescaped 
- * quotes inside it.
+ * Parse a null-terminated input text and find the first entry
+ * deliminated by a pair of unescaped quotes inside it. Advance
+ * the input string address one step after the end quote.
  * 
- * @param str_in         Input text
- * @param **start_quote  Pointer to populate with start quote address
- * @param **end_quote    Pointer to populate with end quote address
+ * @param **str_in       Address of a `const char *` pointing to the input text, which will be advanced.
+ * @param **start_quote  Address of a `const char *` that will receive the start quote address.
+ * @param **end_quote    Address of a `const char *` that will receive the end quote address.
  */
-static int prte_ras_slurm_find_entry(const char *str_in, const char **start_entry, const char **end_entry)
+static int prte_ras_slurm_find_next_quoted(const char **str_in, const char **start_quote, const char **end_quote)
 {
-    if(!str_in || !start_quote || !end_quote) {
+    if(!str_in || !*str_in || !start_quote || !end_quote) {
         PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
         return PRTE_ERR_BAD_PARAM;
     }
@@ -629,9 +629,9 @@ static int prte_ras_slurm_find_entry(const char *str_in, const char **start_entr
     bool start_quote_found = false;
     int backslash_count = 0;
 
-    while('\0' != *str_in && '\n' != *str_in) {
+    while('\0' != **str_in) {
         /* Even number of backslashes --> unescaped */
-        if('\"' == *str_in && 0 == backslash_count % 2) {
+        if('\"' == **str_in && 0 == backslash_count % 2) {
             if(!start_quote_found) {
                 *start_entry = str_in;
                 start_quote_found = true;
@@ -639,7 +639,8 @@ static int prte_ras_slurm_find_entry(const char *str_in, const char **start_entr
             }
             else
             {
-                *end_entry = str_in;
+                *end_entry = *str_in;
+                (*str_in)++;
                 return PRTE_SUCCESS;
             }
         } else if ('\\' == *str_in) {
@@ -647,46 +648,313 @@ static int prte_ras_slurm_find_entry(const char *str_in, const char **start_entr
         } else {
             backslash_count = 0;
         }
-        str_in++;
+        (*str_in)++;
     }
 
     return PRTE_ERR_NOT_FOUND;
 }
 
+/*
+ * Parse a null-terminated or line-break terminated input text
+ * and find the first entry deliminated by a pair of unescaped 
+ * quotes inside it. Advance the input string address one step
+ * after the end quote.
+ * 
+ * @param **str_in       Address of a `const char *` pointing to the input text, which will be advanced.
+ * @param **start_quote  Address of a `const char *` that will receive the start quote address.
+ * @param **end_quote    Address of a `const char *` that will receive the end quote address.
+ */
+static int prte_ras_slurm_find_next_numeric(const char **str_in, const char **numeric_out)
+{
+    if(!str_in || !*str_in || !start_quote || !end_quote) {
+        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    return PRTE_ERR_NOT_FOUND;
+}
+
+
 static int prte_ras_slurm_find_fields(pmix_list_t *fields)
 {
+    int err = PRTE_SUCCESS;
+
     char *slurm_jobid;
     if (NULL == (slurm_jobid = getenv("SLURM_JOBID"))) {
         PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
         return PRTE_ERR_NOT_FOUND;
     }
 
-    char fields[][]
-    {
-        {"account"},
-        {"partition"},
-        {"qos"},
+    char const * const jobs_field = "jobs";
+    bool job_section_found = false;
+
+    const char *const str_fields[] = {
+        "account",
+        "partition",
+        "qos",
+        "current_working_directory",
     };
+
+    const char *const num_fields[] {
+        "end_time",
+    }
+
+    const char *const var_fields[] {
+        "memory_per_cpu",
+        "memory_per_node",
+    }
+
+    struct var_structure {
+        bool set;
+        bool infinite;
+        char* number;
+    }
+
+    const char *const var_subfields[] {
+        "set",
+        "infinite",
+        "number",
+    }
+
+    char const * const str_marker = "str"; 
+    char const * const num_marker = "num"; 
+    char const * const var_marker = "var";
 
     pmix_kval_t *kv;
     pmix_hash_table_t table;
 
     PMIX_CONSTRUCT(&table, pmix_hash_table_t);
 
-    pmix_hash_table_init(&table, sizeof(fields));
+    size_t str_fields_len = sizeof(str_fields) / sizeof(str_fields[0]);
+    size_t num_fields_len = sizeof(num_fields) / sizeof(num_fields[0]);
+    size_t var_fields_len = sizeof(var_fields) / sizeof(var_fields[0]);
+    size_t total_fields_len = str_fields_len + num_fields_len + var_fields_len;
 
-    PMIX_CONSTRUCT(fields, pmix_list_t);
+    pmix_hash_table_init(&table, total_fields_len);
 
-    size_t fields_len = sizeof(fields) / sizeof(fields[0]);
+    /* todo: exclude fields based on MCA params */
 
-    for(size_t i = 0; i < fields_len; i++)
-    {
-        /* todo: exclude fields based on MCA params */
+    for(size_t i = 0; i < str_fields_len; i++) {
+        char *key = strdup(str_fields[i]);
 
-        kv = PMIX_NEW(pmix_kval_t);
-        kv->key = strdup(fields[i]);
-        kv->value = NULL;
-        pmix_hash_table_set_value_ptr(&table, kv->key,
-                              strlen(kv->key), kv);
+        if(NULL == key) {
+            err = PRTE_ERR_OUT_OF_RESOURCE;
+            goto cleanup;
+        }
+
+        /* set value to the specific type pointer, so we know when a field is unset */
+        pmix_hash_table_set_value_ptr(&table, key,
+                              strlen(key), str_marker);
     }
+
+    for(size_t i = 0; i < num_fields_len; i++) {
+        char *key = strdup(num_fields[i]);
+
+        if(NULL == key) {
+            err = PRTE_ERR_OUT_OF_RESOURCE;
+            goto cleanup;
+        }
+
+        pmix_hash_table_set_value_ptr(&table, key,
+                                strlen(key), num_marker);
+    }
+
+    for(size_t i = 0; i < var_fields_len; i++) {
+        char *key = strdup(var_fields[i]);
+
+        if(NULL == key) {
+            err = PRTE_ERR_OUT_OF_RESOURCE;
+            goto cleanup;
+        }
+
+        pmix_hash_table_set_value_ptr(&table, key,
+                                strlen(key), var_marker);
+    }
+
+    FILE *fp;
+
+    /* TODO: how about Slurm-side errors */
+
+    fp = popen("cat example_slurm_json.txt", "r");
+
+    if(!fp) {
+        printf("popen error\n");
+    }
+
+    char *line = NULL;
+    size_t len = 0;
+    ssize_t read;
+
+    int count_found = 0;
+
+    bool jobs_section_found = false;
+
+    bool looking_for_key = true;
+    bool looking_for_colon = false;
+
+    const char *open_quote = NULL;
+    const char *close_quote = NULL;
+
+    const char *key_ptr = NULL;
+    const char *val_ptr = NULL;
+
+    /* output probably consists of multiple lines, but 
+     * would still be valid JSON even if one big line */
+    while (-1 != (read = getline(&line, &len, fp))) {
+
+        /* remove any whitespace from read line, as JSON does too */
+
+        char *line_read = line;
+        char *line_write = line;
+
+        while('\0' != *line_read)
+        {
+            if(!isspace((unsigned char)*line_read)) {
+                *line_write++ = *line_read;
+            }
+
+            line_read++;
+        }
+
+        *line_write = '\0';
+
+        /* process non-whitespace line */
+
+        while('\0' != *line) {
+
+            /* look for keys in unescaped quotes */
+            if(looking_for_key && !looking_for_colon
+                && PRTE_ERR_NOT_FOUND != prte_ras_slurm_find_next_quoted(&line, &open_quote, &close_quote)) {
+            
+                    const char * start_text = open_quote+1;
+                    size_t len = close_quote - start_text;
+
+                    key_ptr = strndup(start_text, len);
+
+                    if(NULL == key_ptr) {
+                        err = PRTE_ERR_OUT_OF_RESOURCE;
+                        goto cleanup;
+                    }
+
+                    looking_for_colon = true;
+            }
+
+            else if(looking_for_colon) {
+
+                /* we know *line is not the nullchar here */
+
+                looking_for_colon = false;
+
+                /* either we found a colon or this is not a key */
+                if(*line != ":")
+                {
+                    /* keep searching for keys */
+                    continue;
+                }
+
+                looking_for_key = false;
+            }
+
+            /* we have a key; check if it is of interest */
+            else if(!looking_for_key) {
+
+                size_t key_len = strlen(key_ptr);
+
+                /* don't bother checking for anything else until we have found the jobs section */
+                if(!jobs_section_found && 0 == strcmp(jobs_field, key_ptr)) {
+                    key_ptr = NULL;
+                    free(key_ptr);
+                    jobs_section_found = true;
+                    looking_for_key = true;
+                    continue;
+                }
+
+                else if (PMIX_SUCCESS == pmix_hash_table_get_value_ptr(&table, key_ptr,
+                                        len, (void**)&val)) {
+                    /* string key */
+                    if(val == str_marker) {
+
+                        /* failed to find a corresponding value for the string key */
+                        if(*line != '"'
+                            || PRTE_ERR_NOT_FOUND == prte_ras_slurm_find_next_quoted(line, &open_quote, &close_quote)) {
+                            err = PRTE_ERR_NOT_FOUND;
+                            goto cleanup; 
+                        }
+
+                        const char * start_text = open_quote+1;
+                        len = close_quote-start_text;
+
+                        val_ptr = strndup(start_text, len);
+
+                        if(NULL == val_ptr) {
+                            err = PRTE_ERR_OUT_OF_RESOURCE;
+                            goto cleanup;
+                        }
+
+                        pmix_hash_table_set_value_ptr(&table, key_ptr,
+                            strlen(key_ptr), val_ptr);
+
+                        free(key_ptr);
+                        free(val_ptr);
+                        key_ptr = NULL;
+                        val_ptr = NULL;
+
+                        /* extracted the string */
+                        count_found++;
+                        looking_for_key = true;
+                    }
+                    
+                    else if(val == num_marker)
+                    {
+                        char *line_start = line;
+                        int len = 0;
+
+                        /* numeric key */
+                        while (isdigit((unsigned char)*line)) {
+                            len++;
+                            line++;
+                        }
+
+                        
+
+                    }
+                }
+            }
+
+            
+    }
+
+        
+    }
+
+    cleanup:
+
+    if(PRTE_SUCCESS != err) {
+        PRTE_ERROR_LOG(err);
+    }
+
+    if(NULL != key_ptr) {
+        free(key_ptr);
+    }
+
+    if(NULL != val_ptr) {
+        free(val_ptr);
+    }
+
+    pmix_hash_table_iterator_t iter;
+    void *key;
+    size_t keylen;
+    void *value;
+
+    PMIX_HASH_TABLE_FOREACH(&iter, &table, key, keylen, value) {
+        free(key);
+
+        if(value != str_marker && value != num_marker && value != var_marker) {
+            free(value);
+        }
+    }
+
+    PMIX_DESTRUCT(&table);
+    return err;
+
 }
