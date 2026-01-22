@@ -88,6 +88,22 @@ static int prte_ras_slurm_discover(char *regexp, char *tasks_per_node, pmix_list
 static int prte_ras_slurm_parse_ranges(char *base, char *ranges, char ***nodelist);
 static int prte_ras_slurm_parse_range(char *base, char *range, char ***nodelist);
 static int prte_ras_slurm_find_next_quoted(const char *str_in, const char **start_entry, const char **end_entry);
+static int prte_ras_slurm_find_next_delimited_obj(const char **str_in, const char **start_obj, const char **end_obj);
+static int prte_ras_slurm_strip_json_whitespace(char *json_text);
+
+/* States for parsing Slurm JSON output */
+typedef enum {
+    STATE_KEY,
+    STATE_COLON,
+    STATE_VAL,
+    STATE_SET,
+} TextParseState;
+
+/* Markers for expected types when parsing Slurm JSON */
+static char const * const str_marker = "str"; /* text-based entry */
+static char const * const num_marker = "num"; /* entry only with digits 0 to 9 */
+static char const * const obj_marker = "obj";  /* JSON object inside brackets {} */
+static char const * const arr_obj_marker = "arr_obj"; /* Array containing single JSON object */
 
 static bool check_taint(char *name, char *evar)
 {
@@ -633,17 +649,17 @@ static int prte_ras_slurm_find_next_quoted(const char **str_in, const char **sta
         /* Even number of backslashes --> unescaped */
         if('\"' == **str_in && 0 == backslash_count % 2) {
             if(!start_quote_found) {
-                *start_entry = str_in;
+                *start_quote = *str_in;
                 start_quote_found = true;
                 backslash_count = 0;
             }
             else
             {
-                *end_entry = *str_in;
+                *end_quote = *str_in;
                 (*str_in)++;
                 return PRTE_SUCCESS;
             }
-        } else if ('\\' == *str_in) {
+        } else if ('\\' == **str_in) {
             backslash_count++;
         } else {
             backslash_count = 0;
@@ -655,28 +671,517 @@ static int prte_ras_slurm_find_next_quoted(const char **str_in, const char **sta
 }
 
 /*
- * Parse a null-terminated or line-break terminated input text
- * and find the first entry deliminated by a pair of unescaped 
- * quotes inside it. Advance the input string address one step
- * after the end quote.
- * 
- * @param **str_in       Address of a `const char *` pointing to the input text, which will be advanced.
- * @param **start_quote  Address of a `const char *` that will receive the start quote address.
- * @param **end_quote    Address of a `const char *` that will receive the end quote address.
+ * Parse a null-terminated string and locate the next object delimited
+ * by balanced open/close characters. Delimiters appearing inside
+ * quoted strings are ignored.
+ *
+ * On success, the input pointer is advanced to the character
+ * immediately following the closing delimiter.
+ *
+ * @param str_in      Address of a `const char *` input pointer, advanced as parsed.
+ * @param open_ch     Opening delimiter character (e.g. '{', '[', '(').
+ * @param close_ch    Closing delimiter character (e.g. '}', ']', ')').
+ * @param start_obj   Receives the address of the opening delimiter.
+ * @param end_obj     Receives the address of the closing delimiter.
+ *
+ * @return PRTE_SUCCESS on success, or a PRTE error code on failure.
  */
-static int prte_ras_slurm_find_next_numeric(const char **str_in, const char **numeric_out)
+static int prte_ras_slurm_find_next_delimited_obj(const char **str_in, char open_ch, char close_ch, const char **start_obj, const char **end_obj)
 {
-    if(!str_in || !*str_in || !start_quote || !end_quote) {
+    if (!str_in || !*str_in || !start_obj || !end_obj) {
         PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
         return PRTE_ERR_BAD_PARAM;
     }
 
+    int bracket_counter = 0;
+
+    const char *next_quote_start = NULL;
+    const char *next_quote_end = NULL;
+
+    while ('\0' != **str_in) {
+
+        /* ignore any quoted area for counting delimiters */
+        if ('"' == **str_in) {
+            int res = prte_ras_slurm_find_next_quoted(
+                &str_in, &next_quote_start, &next_quote_end);
+            if (PRTE_SUCCESS != res) {
+                PRTE_ERROR_LOG(res);
+                return res;
+            }
+        }
+
+        else if (open_ch == **str_in) {
+            if (0 == bracket_counter) {
+                *start_obj = *str_in;
+            }
+            bracket_counter++;
+        }
+
+        else if (close_ch == **str_in) {
+            bracket_counter--;
+
+            if (0 > bracket_counter) {
+                PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
+                return PRTE_ERR_BAD_PARAM;
+            }
+
+            if (0 == bracket_counter) {
+                *end_obj = *str_in;
+                (*str_in)++;
+                return PRTE_SUCCESS;
+            }
+        }
+
+        (*str_in)++;
+    }
+
+    /* either none found or incorrectly formatted */
     return PRTE_ERR_NOT_FOUND;
 }
 
+/*
+ * Strip JSON whitespace characters from a string, ignoring quoted regions.
+ * The operation is performed in-place.
+ *
+ * @param json_text   Mutable null-terminated JSON text buffer.
+ */
+static int prte_ras_slurm_strip_json_whitespace(char *json_text)
+{
+    if (NULL == json_text) {
+        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    const char *read_ptr = json_text;
+    char *write_ptr = json_text;
+
+    const char *quote_start = NULL;
+    const char *quote_end = NULL;
+
+    while ('\0' != *read_ptr) {
+
+        /* copy quoted regions verbatim */
+        if ('"' == *read_ptr) {
+            const char *quote_read = read_ptr;
+            int res = prte_ras_slurm_find_next_quoted(
+                &quote_read, &quote_start, &quote_end);
+            if (PRTE_SUCCESS != res) {
+                PRTE_ERROR_LOG(res);
+                return res;
+            }
+
+            while (read_ptr < quote_read) {
+                *write_ptr++ = *read_ptr++;
+            }
+            continue;
+        }
+
+        /* outside quotes: skip whitespace */
+        if (isspace((unsigned char)*read_ptr)) {
+            read_ptr++;
+            continue;
+        }
+
+        *write_ptr++ = *read_ptr++;
+    }
+
+    *write_ptr = '\0';
+    return PRTE_SUCCESS;
+}
+
+/*
+ * Skip a single JSON value and advance the parse cursor
+ *
+ * Skips over the JSON value starting at *line and advances the cursor to
+ * the first character following the value. Supports strings, objects,
+ * arrays, and primitive values
+ *
+ * @param line A pointer to the current position in a JSON string; updated
+ *             to point past the skipped value
+ */
+static int prte_ras_slurm_skip_json_value(char **line)
+{
+    const char *start = *line;
+    const char *end = NULL;
+    int err;
+
+    switch (**line) {
+    case '"':
+        err = prte_ras_slurm_find_next_quoted(line, &start, &end);
+        if (PRTE_SUCCESS != err) return err;
+        *line = (char *)end + 1;
+        return PRTE_SUCCESS;
+
+    case '{':
+        err = prte_ras_slurm_find_next_delimited_obj(
+            line, '{', '}', &start, &end);
+        if (PRTE_SUCCESS != err) return err;
+        *line = (char *)end + 1;
+        return PRTE_SUCCESS;
+
+    case '[':
+        err = prte_ras_slurm_find_next_delimited_obj(
+            line, '[', ']', &start, &end);
+        if (PRTE_SUCCESS != err) return err;
+        *line = (char *)end + 1;
+        return PRTE_SUCCESS;
+
+    default:
+        /* number, true, false, null */
+        while (**line &&
+               **line != ',' &&
+               **line != '}' &&
+               **line != ']') {
+            (*line)++;
+        }
+        return PRTE_SUCCESS;
+    }
+}
+
+/*
+ * Parse a JSON object string and extract a fixed set of expected keys
+ *
+ * Performs a constrained JSON parse intended for SLURM-generated JSON with
+ * a known schema. Only keys present in the type table are considered.
+ * Parsing fails if any expected key is missing or malformed. The input
+ * string is modified in-place during parsing.
+ *
+ * On success, values stored in the value table are heap-allocated and owned
+ * by the table. On error, any values inserted by this function are removed
+ * and freed.
+ *
+ * @param type_table Hash table mapping expected JSON keys to type markers
+ * @param val_table  Hash table to receive extracted key/value pairs
+ * @param line       NUL-terminated JSON string; modified during parsing
+ */
+static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix_hash_table_t* val_table, char *line)
+{
+    if(!line || !type_table || !val_table) {
+        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    int count_found = 0;
+    int expected_count;
+
+    pmix_hash_table_get_size(type_table, &expected_count);
+
+    int pmix_err = PMIX_SUCCESS;
+    int err = PRTE_SUCCESS;
+
+    /* helper to indicate what stage of parsing we're in */
+    TextParseState parse_state = STATE_KEY;
+
+    const char *open_quote = NULL;
+    const char *close_quote = NULL;
+
+    char *key_ptr = NULL;
+    char *val_ptr = NULL;
+
+    /* remove any whitespace from read line, as JSON does too */
+    prte_ras_slurm_strip_json_whitespace(line);
+
+    while('\0' != *line && expected_count > count_found) {
+
+        switch(parse_state) {
+            
+            /* look for keys in unescaped quotes */
+            case STATE_KEY: {
+
+                if(PRTE_SUCCESS == prte_ras_slurm_find_next_quoted(&line, &open_quote, &close_quote)) {
+
+                    const char * start_text = open_quote+1;
+                    size_t len = close_quote - start_text;
+
+                    key_ptr = strndup(start_text, len);
+
+                    if(NULL == key_ptr) {
+                        err = PRTE_ERR_OUT_OF_RESOURCE;
+                        goto cleanup;
+                    }
+
+                    parse_state = STATE_COLON;
+                    break;
+                
+                }
+                else {
+                    err = PRTE_ERR_NOT_FOUND;
+                    goto cleanup;
+                }
+            }
+
+            /* look for colon following a potential key */
+            case STATE_COLON: {
+                if(*line == ':') {
+                    parse_state = STATE_VAL;
+                } else {
+                    parse_state = STATE_KEY;
+                }
+                line++;
+                break;
+            }
+
+            /* we have a key; check if it is of interest and capture its value */
+            case STATE_VAL: {
+
+                /* must not be NULL */
+                size_t key_len = strlen(key_ptr);
+                
+                char *type_marker;
+
+                /* key not in hash table */ 
+                if (PMIX_SUCCESS != pmix_hash_table_get_value_ptr(type_table, key_ptr,
+                                        key_len, (void**)&type_marker)) {
+                        free(key_ptr);
+                        key_ptr = NULL;
+
+                        err = prte_ras_slurm_skip_json_value(&line);
+                        if (PRTE_SUCCESS != err) {
+                            goto cleanup;
+                        }
+
+                        parse_state = STATE_KEY;
+                        break;
+                }
+
+                /* string key */
+                if(type_marker == str_marker) {
+
+                    /* expected a string and only a string */
+                    if(*line != '"') {
+                        err = PRTE_ERR_NOT_FOUND;
+                        goto cleanup; 
+                    }
+
+                    err = prte_ras_slurm_find_next_quoted(&line, &open_quote, &close_quote);
+        
+                    if(PRTE_SUCCESS != err) {
+                        goto cleanup; 
+                    }
+
+                    const char * start_text = open_quote+1;
+                    size_t len = close_quote-start_text;
+
+                    val_ptr = strndup(start_text, len);
+
+                    if(NULL == val_ptr) {
+                        err = PRTE_ERR_OUT_OF_RESOURCE;
+                        goto cleanup;
+                    }
+
+                    parse_state = STATE_SET;
+                }
+                
+                /* numerical key */
+                else if(type_marker == num_marker) {
+                    char *line_start = line;
+                    size_t len = 0;
+
+                    /* numeric key */
+                    while (isdigit((unsigned char)*line)) {
+                        len++;
+                        line++;
+                    }
+
+                    /* started with some unexpected character */
+                    if(0 == len)
+                    {
+                        err = PRTE_ERR_NOT_FOUND;
+                        goto cleanup; 
+                    }
+                    
+                    val_ptr = strndup(line_start, len);
+
+                    if(NULL == val_ptr) {
+                        err = PRTE_ERR_OUT_OF_RESOURCE;
+                        goto cleanup;
+                    }
+
+                    parse_state = STATE_SET;
+
+                }
+
+                /* JSON object key */
+                else if(type_marker == obj_marker) {
+                    
+                    if(*line != '{') {
+                        err = PRTE_ERR_NOT_FOUND;
+                        goto cleanup;
+                    }
+
+                    const char *obj_start = NULL;
+                    const char *obj_end = NULL;
+                    
+                    err = prte_ras_slurm_find_next_delimited_obj(&line, '{', '}', &obj_start, &obj_end);
+
+                    if(PRTE_SUCCESS != err) {
+                        goto cleanup;   
+                    }
+
+                    const char * start_content = obj_start+1;
+                    size_t len = obj_end - start_content;
+
+                    val_ptr = strndup(start_content, len);
+
+                    if(NULL == val_ptr) {
+                        err = PRTE_ERR_OUT_OF_RESOURCE;
+                        goto cleanup;
+                    }
+                    
+                    parse_state = STATE_SET;
+                }
+
+                /* array containing a single JSON object */
+                else if(type_marker == arr_obj_marker) {
+
+                    if(*line != '[') {
+                        err = PRTE_ERR_NOT_FOUND;
+                        goto cleanup;
+                    }
+
+                    const char *arr_start = NULL;
+                    const char *arr_end = NULL;
+                    
+                    err = prte_ras_slurm_find_next_delimited_obj(&line, '[', ']', &arr_start, &arr_end);
+
+                    if(PRTE_SUCCESS != err) {
+                        goto cleanup;   
+                    }
+
+                    line = arr_start+1;
+
+                    const char *obj_start = NULL;
+                    const char *obj_end = NULL;
+
+                    err = prte_ras_slurm_find_next_delimited_obj(&line, '{', '}', &obj_start, &obj_end);
+
+                    if(PRTE_SUCCESS != err) {
+                        goto cleanup;   
+                    }
+
+                    /* we expect this structure [{object1}] when stripped of whitespace */
+                    if(arr_start != obj_start+1 || obj_end != arr_end-1) {
+                        err = PRTE_ERR_NOT_FOUND;
+                        goto cleanup;
+                    }
+
+                    const char * start_content = obj_start+1;
+                    size_t len = obj_end - start_content;
+
+                    val_ptr = strndup(start_content, len);
+
+                    if(NULL == val_ptr) {
+                        err = PRTE_ERR_OUT_OF_RESOURCE;
+                        goto cleanup;
+                    }
+
+                    parse_state = STATE_SET;
+                }
+
+                else {
+                    /* unknown type, unlikely to happen */ 
+                    err = PRTE_ERR_BAD_PARAM;
+                    goto cleanup;
+                }
+
+                break;
+            }
+
+            case STATE_SET: {
+
+                void *existing;
+
+                /* check for duplicate keys */
+                if (PMIX_SUCCESS != pmix_hash_table_get_value_ptr(val_table, key_ptr,
+                                         strlen(key_ptr), (void**)&existing)) {
+                    
+                    pmix_err = pmix_hash_table_set_value_ptr(val_table, key_ptr, strlen(key_ptr), val_ptr);
+
+                    if(PMIX_SUCCESS != pmix_err) {
+                        err = prte_pmix_convert_rc(pmix_err);
+                        goto cleanup;
+                    }
+
+                    /* do not free as pointer is in in hash table */
+                    val_ptr = NULL;
+
+                    free(key_ptr);
+                    key_ptr = NULL;
+
+                    /* extracted the value */
+                    count_found++;
+
+                } else {
+                    /* duplicates */
+                    free(key_ptr);
+                    free(val_ptr);
+                    key_ptr = NULL;
+                    val_ptr = NULL;
+                }
+                
+                parse_state = STATE_KEY;
+
+                break;
+            }
+
+        }
+    }
+
+    if(expected_count != count_found) {
+        err = PRTE_ERR_NOT_FOUND;
+    }
+
+    cleanup:
+
+    if(key_ptr) {
+        free(key_ptr);
+    }
+
+    if(val_ptr) {
+        free(val_ptr);
+    }
+
+    if (PRTE_SUCCESS != err) {
+        void *key = NULL;
+        size_t keylen = 0;
+        void *next_key = NULL;
+        size_t next_keylen = 0;
+
+        void *node = NULL;
+        void *next_node = NULL;
+
+        /* first element */
+        pmix_hash_table_get_first_key_ptr(
+            val_table, &key, &keylen, NULL, &node);
+
+        while (NULL != key) {
+
+            pmix_hash_table_get_next_key_ptr(
+                val_table,
+                &next_key,
+                &next_keylen,
+                NULL,
+                node,
+                &next_node);
+
+            void *removed_value = NULL;
+            pmix_hash_table_remove_value_ptr(
+                val_table, key, keylen, &removed_value);
+
+            free(removed_value);
+
+            key = next_key;
+            keylen = next_keylen;
+            node = next_node;
+        }
+    }
+
+    return err;
+}
 
 static int prte_ras_slurm_find_fields(pmix_list_t *fields)
 {
+    int pmix_err = PMIX_SUCCESS;
     int err = PRTE_SUCCESS;
 
     char *slurm_jobid;
@@ -715,11 +1220,7 @@ static int prte_ras_slurm_find_fields(pmix_list_t *fields)
         "infinite",
         "number",
     }
-
-    char const * const str_marker = "str"; 
-    char const * const num_marker = "num"; 
-    char const * const var_marker = "var";
-
+    
     pmix_kval_t *kv;
     pmix_hash_table_t table;
 
@@ -789,8 +1290,8 @@ static int prte_ras_slurm_find_fields(pmix_list_t *fields)
 
     bool jobs_section_found = false;
 
-    bool looking_for_key = true;
-    bool looking_for_colon = false;
+    /* helper to indicate what stage of parsing we're in */
+    TextParseState parse_state = STATE_KEY;
 
     const char *open_quote = NULL;
     const char *close_quote = NULL;
@@ -819,113 +1320,8 @@ static int prte_ras_slurm_find_fields(pmix_list_t *fields)
         *line_write = '\0';
 
         /* process non-whitespace line */
-
-        while('\0' != *line) {
-
-            /* look for keys in unescaped quotes */
-            if(looking_for_key && !looking_for_colon
-                && PRTE_ERR_NOT_FOUND != prte_ras_slurm_find_next_quoted(&line, &open_quote, &close_quote)) {
-            
-                    const char * start_text = open_quote+1;
-                    size_t len = close_quote - start_text;
-
-                    key_ptr = strndup(start_text, len);
-
-                    if(NULL == key_ptr) {
-                        err = PRTE_ERR_OUT_OF_RESOURCE;
-                        goto cleanup;
-                    }
-
-                    looking_for_colon = true;
-            }
-
-            else if(looking_for_colon) {
-
-                /* we know *line is not the nullchar here */
-
-                looking_for_colon = false;
-
-                /* either we found a colon or this is not a key */
-                if(*line != ":")
-                {
-                    /* keep searching for keys */
-                    continue;
-                }
-
-                looking_for_key = false;
-            }
-
-            /* we have a key; check if it is of interest */
-            else if(!looking_for_key) {
-
-                size_t key_len = strlen(key_ptr);
-
-                /* don't bother checking for anything else until we have found the jobs section */
-                if(!jobs_section_found && 0 == strcmp(jobs_field, key_ptr)) {
-                    key_ptr = NULL;
-                    free(key_ptr);
-                    jobs_section_found = true;
-                    looking_for_key = true;
-                    continue;
-                }
-
-                else if (PMIX_SUCCESS == pmix_hash_table_get_value_ptr(&table, key_ptr,
-                                        len, (void**)&val)) {
-                    /* string key */
-                    if(val == str_marker) {
-
-                        /* failed to find a corresponding value for the string key */
-                        if(*line != '"'
-                            || PRTE_ERR_NOT_FOUND == prte_ras_slurm_find_next_quoted(line, &open_quote, &close_quote)) {
-                            err = PRTE_ERR_NOT_FOUND;
-                            goto cleanup; 
-                        }
-
-                        const char * start_text = open_quote+1;
-                        len = close_quote-start_text;
-
-                        val_ptr = strndup(start_text, len);
-
-                        if(NULL == val_ptr) {
-                            err = PRTE_ERR_OUT_OF_RESOURCE;
-                            goto cleanup;
-                        }
-
-                        pmix_hash_table_set_value_ptr(&table, key_ptr,
-                            strlen(key_ptr), val_ptr);
-
-                        free(key_ptr);
-                        free(val_ptr);
-                        key_ptr = NULL;
-                        val_ptr = NULL;
-
-                        /* extracted the string */
-                        count_found++;
-                        looking_for_key = true;
-                    }
-                    
-                    else if(val == num_marker)
-                    {
-                        char *line_start = line;
-                        int len = 0;
-
-                        /* numeric key */
-                        while (isdigit((unsigned char)*line)) {
-                            len++;
-                            line++;
-                        }
-
-                        
-
-                    }
-                }
-            }
-
-            
     }
 
-        
-    }
 
     cleanup:
 
