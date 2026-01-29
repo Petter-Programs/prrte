@@ -62,6 +62,7 @@
 #include "src/mca/ras/base/base.h"
 
 #define PRTE_SLURM_DYN_MAX_SIZE 256
+#define PRTE_SLURM_JOB_INFO_MAX_SIZE (1 * 1024 * 1024)
 
 /*
  * API functions
@@ -102,8 +103,47 @@ typedef enum {
 /* Markers for expected types when parsing Slurm JSON */
 static char const * const str_marker = "str"; /* text-based entry */
 static char const * const num_marker = "num"; /* entry only with digits 0 to 9 */
+static char const * const bool_marker = "bool"; /* entry only with digits 0 to 9 */
 static char const * const obj_marker = "obj";  /* JSON object inside brackets {} */
 static char const * const arr_obj_marker = "arr_obj"; /* Array containing single JSON object */
+
+/* Fields to parse from Slurm JSON */
+
+static char const * const jobs_field = "jobs";
+
+static const char *const str_fields[] = {
+    "account",
+    "partition",
+    "qos",
+    "current_working_directory",
+};
+
+static const char *const num_fields[] = {
+    "end_time",
+};
+
+static const char *const num_obj_fields[] = {
+    "memory_per_cpu",
+    "memory_per_node",
+};
+
+static const char *const num_obj_subfields[] {
+    "set",
+    "infinite",
+    "number",
+};
+
+static const char *const num_obj_subfield_types[] {
+    bool_marker,
+    bool_marker,
+    num_marker,
+};
+
+static const size_t str_fields_len = sizeof(str_fields) / sizeof(str_fields[0]);
+static const size_t num_fields_len = sizeof(num_fields) / sizeof(num_fields[0]);
+static const size_t num_obj_fields_len = sizeof(num_obj_fields) / sizeof(num_obj_fields[0]);
+static const size_t total_fields_len = str_fields_len + num_fields_len + num_obj_fields_len;
+static const size_t num_obj_subfields_len = sizeof(num_obj_subfield_types) / sizeof(num_obj_subfield_types[0]);
 
 static bool check_taint(char *name, char *evar)
 {
@@ -839,7 +879,7 @@ static int prte_ras_slurm_skip_json_value(char **line)
 }
 
 /*
- * Parse a JSON object string and extract a fixed set of expected keys
+ * Parse a Slurm JSON-format input and extract a fixed set of expected keys
  *
  * Performs a constrained JSON parse intended for SLURM-generated JSON with
  * a known schema. Only keys present in the type table are considered.
@@ -852,11 +892,11 @@ static int prte_ras_slurm_skip_json_value(char **line)
  *
  * @param type_table Hash table mapping expected JSON keys to type markers
  * @param val_table  Hash table to receive extracted key/value pairs
- * @param line       NUL-terminated JSON string; modified during parsing
+ * @param slurm_json NUL-terminated JSON string; modified during parsing
  */
-static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix_hash_table_t* val_table, char *line)
+static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix_hash_table_t* val_table, char *slurm_json)
 {
-    if(!line || !type_table || !val_table) {
+    if(!slurm_json || !type_table || !val_table) {
         PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
         return PRTE_ERR_BAD_PARAM;
     }
@@ -878,17 +918,17 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
     char *key_ptr = NULL;
     char *val_ptr = NULL;
 
-    /* remove any whitespace from read line, as JSON does too */
-    prte_ras_slurm_strip_json_whitespace(line);
+    /* remove any whitespace or linebreaks, as JSON does too */
+    prte_ras_slurm_strip_json_whitespace(slurm_json);
 
-    while('\0' != *line && expected_count > count_found) {
+    while('\0' != *slurm_json && expected_count > count_found) {
 
         switch(parse_state) {
             
             /* look for keys in unescaped quotes */
             case STATE_KEY: {
 
-                if(PRTE_SUCCESS == prte_ras_slurm_find_next_quoted(&line, &open_quote, &close_quote)) {
+                if(PRTE_SUCCESS == prte_ras_slurm_find_next_quoted(&slurm_json, &open_quote, &close_quote)) {
 
                     const char * start_text = open_quote+1;
                     size_t len = close_quote - start_text;
@@ -912,12 +952,12 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
 
             /* look for colon following a potential key */
             case STATE_COLON: {
-                if(*line == ':') {
+                if(*slurm_json == ':') {
                     parse_state = STATE_VAL;
                 } else {
                     parse_state = STATE_KEY;
                 }
-                line++;
+                slurm_json++;
                 break;
             }
 
@@ -935,7 +975,7 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
                         free(key_ptr);
                         key_ptr = NULL;
 
-                        err = prte_ras_slurm_skip_json_value(&line);
+                        err = prte_ras_slurm_skip_json_value(&slurm_json);
                         if (PRTE_SUCCESS != err) {
                             goto cleanup;
                         }
@@ -948,12 +988,12 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
                 if(type_marker == str_marker) {
 
                     /* expected a string and only a string */
-                    if(*line != '"') {
+                    if(*slurm_json != '"') {
                         err = PRTE_ERR_NOT_FOUND;
                         goto cleanup; 
                     }
 
-                    err = prte_ras_slurm_find_next_quoted(&line, &open_quote, &close_quote);
+                    err = prte_ras_slurm_find_next_quoted(&slurm_json, &open_quote, &close_quote);
         
                     if(PRTE_SUCCESS != err) {
                         goto cleanup; 
@@ -974,13 +1014,13 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
                 
                 /* numerical key */
                 else if(type_marker == num_marker) {
-                    char *line_start = line;
+                    char *line_start = slurm_json;
                     size_t len = 0;
 
                     /* numeric key */
-                    while (isdigit((unsigned char)*line)) {
+                    while (isdigit((unsigned char)*slurm_json)) {
                         len++;
-                        line++;
+                        slurm_json++;
                     }
 
                     /* started with some unexpected character */
@@ -1001,10 +1041,43 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
 
                 }
 
+                /* boolean type */
+                else if(type_marker == bool_marker) {
+
+                    /* technically, a value like trueX would be accepted here,
+                    * but the goal is not a fully compliant parser; we expect
+                    * the Slurm output to be well behaved */
+
+                    char *val;
+                    
+                    if(0 == strncmp(slurm_json, "true", 4)) {
+                        val = "true";
+                        slurm_json+=4;
+                    }
+
+                    else if(0 == strncmp(slurm_json, "false", 5)) {
+                        val = "false";
+                        slurm_json+=5;
+                    }
+
+                    else {
+                        err = PRTE_ERR_NOT_FOUND;
+                        goto cleanup;
+                    }
+                    
+                    key_ptr = strdup(val);
+
+                    if(NULL == val_ptr) {
+                        err = PRTE_ERR_OUT_OF_RESOURCE;
+                        goto cleanup;
+                    }
+
+                }
+
                 /* JSON object key */
                 else if(type_marker == obj_marker) {
                     
-                    if(*line != '{') {
+                    if(*slurm_json != '{') {
                         err = PRTE_ERR_NOT_FOUND;
                         goto cleanup;
                     }
@@ -1012,7 +1085,7 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
                     const char *obj_start = NULL;
                     const char *obj_end = NULL;
                     
-                    err = prte_ras_slurm_find_next_delimited_obj(&line, '{', '}', &obj_start, &obj_end);
+                    err = prte_ras_slurm_find_next_delimited_obj(&slurm_json, '{', '}', &obj_start, &obj_end);
 
                     if(PRTE_SUCCESS != err) {
                         goto cleanup;   
@@ -1034,7 +1107,7 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
                 /* array containing a single JSON object */
                 else if(type_marker == arr_obj_marker) {
 
-                    if(*line != '[') {
+                    if(*slurm_json != '[') {
                         err = PRTE_ERR_NOT_FOUND;
                         goto cleanup;
                     }
@@ -1042,18 +1115,18 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
                     const char *arr_start = NULL;
                     const char *arr_end = NULL;
                     
-                    err = prte_ras_slurm_find_next_delimited_obj(&line, '[', ']', &arr_start, &arr_end);
+                    err = prte_ras_slurm_find_next_delimited_obj(&slurm_json, '[', ']', &arr_start, &arr_end);
 
                     if(PRTE_SUCCESS != err) {
                         goto cleanup;   
                     }
 
-                    line = arr_start+1;
+                    slurm_json = arr_start+1;
 
                     const char *obj_start = NULL;
                     const char *obj_end = NULL;
 
-                    err = prte_ras_slurm_find_next_delimited_obj(&line, '{', '}', &obj_start, &obj_end);
+                    err = prte_ras_slurm_find_next_delimited_obj(&slurm_json, '{', '}', &obj_start, &obj_end);
 
                     if(PRTE_SUCCESS != err) {
                         goto cleanup;   
@@ -1078,8 +1151,8 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
                     parse_state = STATE_SET;
                 }
 
+                /* unknown or unexpected type */ 
                 else {
-                    /* unknown type, unlikely to happen */ 
                     err = PRTE_ERR_BAD_PARAM;
                     goto cleanup;
                 }
@@ -1141,48 +1214,42 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
         free(val_ptr);
     }
 
-    if (PRTE_SUCCESS != err) {
-        void *key = NULL;
-        size_t keylen = 0;
-        void *next_key = NULL;
-        size_t next_keylen = 0;
-
-        void *node = NULL;
-        void *next_node = NULL;
-
-        /* first element */
-        pmix_hash_table_get_first_key_ptr(
-            val_table, &key, &keylen, NULL, &node);
-
-        while (NULL != key) {
-
-            pmix_hash_table_get_next_key_ptr(
-                val_table,
-                &next_key,
-                &next_keylen,
-                NULL,
-                node,
-                &next_node);
-
-            void *removed_value = NULL;
-            pmix_hash_table_remove_value_ptr(
-                val_table, key, keylen, &removed_value);
-
-            free(removed_value);
-
-            key = next_key;
-            keylen = next_keylen;
-            node = next_node;
-        }
-    }
-
     return err;
 }
 
-static int prte_ras_slurm_find_fields(pmix_list_t *fields)
+/**
+ * @brief Wipe and free() all values in a PMIx hash table.
+ *
+ * Iterates over all elements in the given PMIx hash table,
+ * frees the memory pointed to by each element's value field, and then
+ * removes all entries from the table.
+ * 
+ * This function does not destroy the hash table object itself.
+ * 
+ * @param table Pointer to the PMIx hash table to be wiped.
+ */
+static int prte_ras_slurm_wipe_dyn_hashtable(pmix_hash_table_t *table) {
+    pmix_hash_element_t *elt = NULL;
+    void *node = NULL;
+
+    while (PMIX_SUCCESS ==
+        pmix_hash_table_get_next_elt(table, elt, &elt)) {
+        free(elt->value);
+    }
+    err = pmix_hash_table_remove_all(table);
+    return prte_pmix_convert_rc(err);
+}
+
+static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
 {
     int pmix_err = PMIX_SUCCESS;
     int err = PRTE_SUCCESS;
+
+    FILE *fp = NULL;
+
+    char *slurm_json = NULL;
+    char *jobs_json_obj = NULL;
+    char *cmd = NULL;
 
     char *slurm_jobid;
     if (NULL == (slurm_jobid = getenv("SLURM_JOBID"))) {
@@ -1190,167 +1257,339 @@ static int prte_ras_slurm_find_fields(pmix_list_t *fields)
         return PRTE_ERR_NOT_FOUND;
     }
 
-    char const * const jobs_field = "jobs";
-    bool job_section_found = false;
-
-    const char *const str_fields[] = {
-        "account",
-        "partition",
-        "qos",
-        "current_working_directory",
-    };
-
-    const char *const num_fields[] {
-        "end_time",
-    }
-
-    const char *const var_fields[] {
-        "memory_per_cpu",
-        "memory_per_node",
-    }
-
-    struct var_structure {
-        bool set;
-        bool infinite;
-        char* number;
-    }
-
-    const char *const var_subfields[] {
-        "set",
-        "infinite",
-        "number",
-    }
+    /* make sure the job ID read is something reasonable */
     
-    pmix_kval_t *kv;
-    pmix_hash_table_t table;
+    size_t id_len = strlen(slurm_jobid);
+    if (id_len == 0 || id_len > 20) {
+        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
+        return PRTE_ERR_BAD_PARAM;
+    }
 
-    PMIX_CONSTRUCT(&table, pmix_hash_table_t);
-
-    size_t str_fields_len = sizeof(str_fields) / sizeof(str_fields[0]);
-    size_t num_fields_len = sizeof(num_fields) / sizeof(num_fields[0]);
-    size_t var_fields_len = sizeof(var_fields) / sizeof(var_fields[0]);
-    size_t total_fields_len = str_fields_len + num_fields_len + var_fields_len;
-
-    pmix_hash_table_init(&table, total_fields_len);
+    for (const char *p = slurm_jobid; *p != '\0'; ++p) {
+        if (!isdigit((unsigned char)*p)) {
+            PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
+            return PRTE_ERR_BAD_PARAM;
+        }
+    }
 
     /* todo: exclude fields based on MCA params */
 
-    for(size_t i = 0; i < str_fields_len; i++) {
-        char *key = strdup(str_fields[i]);
+    pmix_hash_table_t tmp_table;
+    pmix_hash_table_t types_table;
 
-        if(NULL == key) {
-            err = PRTE_ERR_OUT_OF_RESOURCE;
-            goto cleanup;
-        }
+    PMIX_CONSTRUCT(&tmp_table, pmix_hash_table_t);
+    PMIX_CONSTRUCT(&types_table, pmix_hash_table_t);
 
-        /* set value to the specific type pointer, so we know when a field is unset */
-        pmix_hash_table_set_value_ptr(&table, key,
-                              strlen(key), str_marker);
+    /*
+    * use hash tables to match expected keys with expected value types
+    * and to store their extracted result 
+    */
+
+    pmix_err = pmix_hash_table_init(&types_table, total_fields_len);
+
+    if(PMIX_SUCCESS != pmix_err) {
+        PMIX_DESTRUCT(&types_table);
+        return prte_pmix_convert_rc(pmix_err);
     }
 
-    for(size_t i = 0; i < num_fields_len; i++) {
-        char *key = strdup(num_fields[i]);
+    pmix_err = pmix_hash_table_init(&tmp_table, total_fields_len);
 
-        if(NULL == key) {
-            err = PRTE_ERR_OUT_OF_RESOURCE;
-            goto cleanup;
-        }
-
-        pmix_hash_table_set_value_ptr(&table, key,
-                                strlen(key), num_marker);
+    if(PMIX_SUCCESS != pmix_err) {
+        PMIX_DESTRUCT(&types_table);
+        PMIX_DESTRUCT(&tmp_table);
+        return prte_pmix_convert_rc(pmix_err);
     }
-
-    for(size_t i = 0; i < var_fields_len; i++) {
-        char *key = strdup(var_fields[i]);
-
-        if(NULL == key) {
-            err = PRTE_ERR_OUT_OF_RESOURCE;
-            goto cleanup;
-        }
-
-        pmix_hash_table_set_value_ptr(&table, key,
-                                strlen(key), var_marker);
-    }
-
-    FILE *fp;
 
     /* TODO: how about Slurm-side errors */
 
-    fp = popen("cat example_slurm_json.txt", "r");
+    char *cmd_format = "scontrol show job %s --json";
+
+    if(0 > asprintf(&cmd, cmd_format, slurm_jobid)) {
+        cmd = NULL;
+        err = PRTE_ERR_OUT_OF_RESOURCE;
+        goto cleanup;
+    }
+
+    fp = popen(cmd, "r");
 
     if(!fp) {
-        printf("popen error\n");
+        err = PRTE_ERR_FILE_OPEN_FAILURE;
+        goto cleanup;
     }
 
-    char *line = NULL;
+    size_t curr_limit = 4096;
     size_t len = 0;
-    ssize_t read;
 
-    int count_found = 0;
+    slurm_json = malloc(curr_limit);
 
-    bool jobs_section_found = false;
+    if (!slurm_json) {
+        err = PRTE_ERR_OUT_OF_RESOURCE;
+        goto cleanup;
+    }
 
-    /* helper to indicate what stage of parsing we're in */
-    TextParseState parse_state = STATE_KEY;
+    char buf[1024];
+    while (fgets(buf, sizeof(buf), fp)) {
+        size_t chunk_len = strlen(buf);
 
-    const char *open_quote = NULL;
-    const char *close_quote = NULL;
+        if (len + chunk_len + 1 > curr_limit) {
+            curr_limit *= 2;
 
-    const char *key_ptr = NULL;
-    const char *val_ptr = NULL;
-
-    /* output probably consists of multiple lines, but 
-     * would still be valid JSON even if one big line */
-    while (-1 != (read = getline(&line, &len, fp))) {
-
-        /* remove any whitespace from read line, as JSON does too */
-
-        char *line_read = line;
-        char *line_write = line;
-
-        while('\0' != *line_read)
-        {
-            if(!isspace((unsigned char)*line_read)) {
-                *line_write++ = *line_read;
+            if(curr_limit > PRTE_SLURM_JOB_INFO_MAX_SIZE) {
+                err = PRTE_ERR_MEM_LIMIT_EXCEEDED;
+                goto cleanup;
             }
 
-            line_read++;
+            char *tmp = realloc(slurm_json, curr_limit);
+            if (!tmp) {
+                err = PRTE_ERR_OUT_OF_RESOURCE;
+                goto cleanup;
+            }
+
+            slurm_json = tmp;
         }
 
-        *line_write = '\0';
-
-        /* process non-whitespace line */
+        memcpy(slurm_json + len, buf, chunk_len);
+        len += chunk_len;
     }
 
+    slurm_json[len] = '\0';
+
+    pclose(fp);
+    fp = NULL;
+
+    if(0 == strlen(slurm_json)) {
+        err = PRTE_ERR_NOT_FOUND;
+        goto cleanup;
+    }
+
+    /* first, extract the object inside the "jobs" field of the Slurm JSON. 
+     * this implicitly also validates that we got exactly one match, because
+     * prte_ras_slurm_match_json_entries checks for exactly one JSON object
+     * inside an array structure, and would fail if there is more */
+
+    pmix_err = pmix_hash_table_set_value_ptr(&types_table, jobs_field,
+                            strlen(jobs_field), arr_obj_marker);
+
+    if(PMIX_SUCCESS != pmix_err) {
+        err = prte_pmix_convert_rc(pmix_err);
+        goto cleanup;
+    }
+
+    err = prte_ras_slurm_match_json_entries(&types_table, &tmp_table, slurm_json);
+
+    if(PRTE_SUCCESS != err) {
+        goto cleanup;
+    }
+
+    char *jobs_json_obj_val;
+
+    pmix_err = pmix_hash_table_get_value_ptr(&tmp_table, jobs_field,
+                                        strlen(jobs_field), (void**)&jobs_json_obj_val);
+    
+    if(PMIX_SUCCESS != pmix_err) {
+        goto cleanup;
+    }
+    
+    pmix_err = pmix_hash_table_remove_value_ptr(&types_table, jobs_field, strlen(jobs_field));
+
+    if(PMIX_SUCCESS != pmix_err) {
+        goto cleanup;
+    }
+
+    /* currently owned by the tmp table, which we will clear later, so duplicate it */
+    jobs_json_obj = strdup(jobs_json_obj_val);
+
+    if(NULL == jobs_json_obj) {
+        err = PRTE_ERR_OUT_OF_RESOURCE;
+        goto cleanup;
+    }
+
+    /* we've extracted a valid "jobs" section. now extract the complex numeric
+     * fields that have "set", "infinite", and "number" fields into a temporary
+     * table which we can then process */
+
+    for(size_t i = 0; i < num_obj_fields_len && PMIX_SUCCESS == pmix_err; i++) {
+        pmix_err = pmix_hash_table_set_value_ptr(&types_table, num_obj_fields[i],
+                                strlen(num_obj_fields[i]), obj_marker);
+    }
+
+    if(PMIX_SUCCESS != pmix_err) {
+        goto cleanup;
+    }
+
+    err = prte_ras_slurm_match_json_entries(&types_table, &tmp_table, jobs_json_obj);
+
+    if(PRTE_SUCCESS != err) {
+        goto cleanup;
+    }
+
+    for(size_t i = 0; i < num_obj_fields_len && PMIX_SUCCESS == pmix_err; i++) {
+        pmix_err = pmix_hash_table_remove_value_ptr(&types_table, num_obj_fields[i], strlen(num_obj_fields[i]));
+    }
+
+    if(PMIX_SUCCESS != pmix_err) {
+        err = prte_pmix_convert_rc(pmix_err);
+        goto cleanup;
+    }
+
+    /* numbers in JSON object format: set, infinite, number 
+     *  here, set the names of these subfields and their types */
+    for(size_t i = 0; i < num_obj_subfields_len && PMIX_SUCCESS == pmix_err; i++) {
+        pmix_err = pmix_hash_table_set_value_ptr(&types_table, num_obj_subfields[i],
+                                strlen(num_obj_subfields[i]), num_obj_subfield_types[i]);
+    }
+
+    if(PMIX_SUCCESS != pmix_err) {
+        err = prte_pmix_convert_rc(pmix_err);
+        goto cleanup;
+    }
+
+    for(size_t i = 0; i < num_obj_fields_len && PRTE_SUCCESS == err; i++) {
+
+        char *num_obj_field;
+
+        pmix_err = pmix_hash_table_get_value_ptr(&tmp_table, num_obj_fields[i],
+                                        strlen(num_obj_fields[i]), (void**)&num_obj_field);
+
+        if(PMIX_SUCCESS != pmix_err) {
+            err = prte_pmix_convert_rc(pmix_err);
+            goto cleanup;
+        }
+
+        err = prte_ras_slurm_match_json_entries(&types_table, &tmp_table, num_obj_field);
+        
+        if(PRTE_SUCCESS != err) {
+            goto cleanup;
+        }
+
+        char *set;
+        char *infinite;
+        char *value;
+
+        pmix_err = pmix_hash_table_get_value_ptr(&tmp_table, "set",
+                                strlen("set"), (void**)&set);
+
+        if(PMIX_SUCCESS != pmix_err) {
+            goto cleanup;
+        }
+
+        pmix_err = pmix_hash_table_get_value_ptr(&tmp_table, "infinite",
+                                strlen("infinite"), (void**)&infinite);
+
+        if(PMIX_SUCCESS != pmix_err) {
+            goto cleanup;
+        }
+
+        pmix_err = pmix_hash_table_get_value_ptr(&tmp_table, "number",
+                                strlen("number"), (void**)&value);
+
+        if(PMIX_SUCCESS != pmix_err) {
+            goto cleanup;
+        }
+
+        if(0 == strcmp(set, "false")) {
+            char *empty_dyn = strdup("");
+
+            if(NULL == empty_dyn) {
+                err = PRTE_ERR_OUT_OF_RESOURCE;
+                goto cleanup;
+            }
+
+            pmix_err = pmix_hash_table_set_value_ptr(values_table, num_obj_fields[i],
+                        strlen(num_obj_fields[i]), empty_dyn);
+        }
+
+        else if(0 == strcmp(infinite, "true")) {
+
+            char *inf_dyn = strdup("inf");
+
+            if(NULL == inf_dyn) {
+                err = PRTE_ERR_OUT_OF_RESOURCE;
+                goto cleanup;
+            }
+
+            pmix_err = pmix_hash_table_set_value_ptr(values_table, num_obj_fields[i],
+            strlen(num_obj_fields[i]), inf_dyn);
+        }
+
+        else {
+            char *val_dup = strdup(value);
+
+            if(NULL == val_dup) {
+                err = PRTE_ERR_OUT_OF_RESOURCE;
+                goto cleanup;
+            }
+
+            pmix_err = pmix_hash_table_set_value_ptr(values_table, num_obj_fields[i],
+            strlen(num_obj_fields[i]), val_dup);
+        }
+
+        if(PMIX_SUCCESS != pmix_err) {
+            goto cleanup;
+        }
+
+        /* wipe the temporary values as we no longer need them */
+        err = prte_ras_slurm_wipe_dyn_hashtable(&tmp_table);
+
+        if(PRTE_SUCCESS != err) {
+            goto cleanup;
+        }
+    }
+
+    pmix_err = pmix_hash_table_remove_all(&types_table);
+
+    /* finally, find the string and numeric fields and add them to our value table */
+
+    for(size_t i = 0; i < str_fields_len && PMIX_SUCCESS == pmix_err; i++) {
+        pmix_err = pmix_hash_table_set_value_ptr(&types_table, str_fields[i],
+                              strlen(str_fields[i]), str_marker);
+    }
+
+    for(size_t i = 0; i < num_fields_len && PMIX_SUCCESS == pmix_err; i++) {
+        pmix_err = pmix_hash_table_set_value_ptr(&types_table, num_fields[i],
+                                strlen(num_fields[i]), num_marker);
+    }
+
+    if(PMIX_SUCCESS != pmix_err) {
+        goto cleanup;
+    }
+
+    err = prte_ras_slurm_match_json_entries(&types_table, values_table, jobs_json_obj);
+
+    if(PRTE_SUCCESS != err) {
+        goto cleanup;
+    }
 
     cleanup:
+
+    if(PMIX_SUCCESS != pmix_err) {
+        err = prte_pmix_convert_rc(pmix_err);
+    }
 
     if(PRTE_SUCCESS != err) {
         PRTE_ERROR_LOG(err);
     }
 
-    if(NULL != key_ptr) {
-        free(key_ptr);
+    if(NULL != fp) {
+        pclose(fp);
     }
 
-    if(NULL != val_ptr) {
-        free(val_ptr);
+    if(NULL != slurm_json) {
+        free(slurm_json);
     }
 
-    pmix_hash_table_iterator_t iter;
-    void *key;
-    size_t keylen;
-    void *value;
-
-    PMIX_HASH_TABLE_FOREACH(&iter, &table, key, keylen, value) {
-        free(key);
-
-        if(value != str_marker && value != num_marker && value != var_marker) {
-            free(value);
-        }
+    if(NULL != jobs_json_obj) {
+        free(jobs_json_obj);
     }
 
-    PMIX_DESTRUCT(&table);
+    if(NULL != cmd) {
+        free(cmd);
+    }
+
+    prte_ras_slurm_wipe_dyn_hashtable(&tmp_table);
+
+    PMIX_DESTRUCT(&tmp_table);
+    PMIX_DESTRUCT(&types_table);
+
     return err;
-
 }
