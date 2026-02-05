@@ -18,7 +18,7 @@
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2016      IBM Corporation.  All rights reserved.
  * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
- * Copyright (c) 2025      Barcelona Supercomputing Center (BSC-CNS).
+ * Copyright (c) 2026      Barcelona Supercomputing Center (BSC-CNS).
  *                         All rights reserved.
  * $COPYRIGHT$
  *
@@ -35,6 +35,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #ifdef HAVE_NETINET_IN_H
 #    include <netinet/in.h>
@@ -91,6 +92,23 @@ static int prte_ras_slurm_parse_range(char *base, char *range, char ***nodelist)
 static int prte_ras_slurm_find_next_quoted(const char *str_in, const char **start_entry, const char **end_entry);
 static int prte_ras_slurm_find_next_delimited_obj(const char **str_in, const char **start_obj, const char **end_obj);
 static int prte_ras_slurm_strip_json_whitespace(char *json_text);
+static int prte_ras_slurm_skip_json_value(char **line);
+static int prte_ras_slurm_string_is_safe(const char *s, bool *safe);
+static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix_hash_table_t* val_table, char *slurm_json);
+static int prte_ras_slurm_wipe_dyn_hashtable(pmix_hash_table_t *table);
+static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table);
+static int prte_ras_slurm_make_job_field(pmix_hash_table_t const *fields, const char *field_name, const char *field_format, char **field_out, bool obj_num);
+static int prte_ras_slurm_launch_expander_job(pmix_hash_table_t const *fields);
+
+/* Slurm sbatch formats */
+static const char *account_format   = "#SBATCH --account=%s\n";
+static const char *partition_format = "#SBATCH --partition=%s\n";
+static const char *qos_format       = "#SBATCH --qos=%s\n";
+static const char *cwd_format       = "#SBATCH --chdir=%s\n";
+static const char *mem_per_cpu_format  = "#SBATCH --mem-per-cpu=%ld\n";
+static const char *mem_per_node_format = "#SBATCH --mem=%ld\n";
+static const char *time_format = "#SBATCH --time=%s\n";
+static const char *nodes_format = "#SBATCH --nodes=%s\n";
 
 /* States for parsing Slurm JSON output */
 typedef enum {
@@ -103,47 +121,74 @@ typedef enum {
 /* Markers for expected types when parsing Slurm JSON */
 static char const * const str_marker = "str"; /* text-based entry */
 static char const * const num_marker = "num"; /* entry only with digits 0 to 9 */
-static char const * const bool_marker = "bool"; /* entry only with digits 0 to 9 */
+static char const * const bool_marker = "bool"; /* entry that is true or false */
 static char const * const obj_marker = "obj";  /* JSON object inside brackets {} */
 static char const * const arr_obj_marker = "arr_obj"; /* Array containing single JSON object */
+
+static char const * const unset_num_marker = "none";  /* Marker for numbers with set: false */
+static char const * const infinite_num_marker = "inf"; /* Marker for numbers with set: true and infinite: true */
 
 /* Fields to parse from Slurm JSON */
 
 static char const * const jobs_field = "jobs";
 
-static const char *const str_fields[] = {
-    "account",
-    "partition",
-    "qos",
-    "current_working_directory",
+enum slurm_str_field {
+    STR_ACCOUNT,
+    STR_PARTITION,
+    STR_QOS,
+    STR_CWD,
+    STR_FIELD_COUNT
 };
 
-static const char *const num_fields[] = {
-    "end_time",
+static const char *const str_fields[STR_FIELD_COUNT] = {
+    [STR_ACCOUNT]   = "account",
+    [STR_PARTITION] = "partition",
+    [STR_QOS]       = "qos",
+    [STR_CWD]       = "current_working_directory",
 };
 
-static const char *const num_obj_fields[] = {
-    "memory_per_cpu",
-    "memory_per_node",
+enum slurm_num_obj_field {
+    NUM_OBJ_MEMORY_PER_CPU,
+    NUM_OBJ_MEMORY_PER_NODE,
+    NUM_OBJ_TIME_LIMIT,
+    NUM_OBJ_FIELD_COUNT
 };
 
-static const char *const num_obj_subfields[] {
-    "set",
-    "infinite",
-    "number",
+static const char *const num_obj_fields[NUM_OBJ_FIELD_COUNT] = {
+    [NUM_OBJ_MEMORY_PER_CPU]  = "memory_per_cpu",
+    [NUM_OBJ_MEMORY_PER_NODE] = "memory_per_node",
+    [NUM_OBJ_TIME_LIMIT] = "time_limit",
 };
 
-static const char *const num_obj_subfield_types[] {
+enum slurm_num_obj_subfield {
+    NUM_OBJ_SUBFIELD_SET,
+    NUM_OBJ_SUBFIELD_INFINITE,
+    NUM_OBJ_SUBFIELD_NUMBER,
+    NUM_OBJ_SUBFIELD_COUNT
+};
+
+static const char *const num_obj_subfields[NUM_OBJ_SUBFIELD_COUNT] = {
+    [NUM_OBJ_SUBFIELD_SET]      = "set",
+    [NUM_OBJ_SUBFIELD_INFINITE] = "infinite",
+    [NUM_OBJ_SUBFIELD_NUMBER]   = "number",
+};
+
+static const char *const num_obj_subfield_types[] = {
     bool_marker,
     bool_marker,
     num_marker,
 };
 
-static const size_t str_fields_len = sizeof(str_fields) / sizeof(str_fields[0]);
-static const size_t num_fields_len = sizeof(num_fields) / sizeof(num_fields[0]);
-static const size_t num_obj_fields_len = sizeof(num_obj_fields) / sizeof(num_obj_fields[0]);
-static const size_t total_fields_len = str_fields_len + num_fields_len + num_obj_fields_len;
-static const size_t num_obj_subfields_len = sizeof(num_obj_subfield_types) / sizeof(num_obj_subfield_types[0]);
+enum slurm_prte_request_fields {
+    PRTE_REQUEST_NODES,
+    PRTE_REQUEST_COUNT
+};
+
+static const char *const prte_request_fields[PRTE_REQUEST_COUNT] = {
+    [PRTE_REQUEST_NODES]      = "nodes",
+};
+
+static const size_t total_fields_len = STR_FIELD_COUNT + NUM_OBJ_FIELD_COUNT + PRTE_REQUEST_COUNT;
 
 static bool check_taint(char *name, char *evar)
 {
@@ -286,14 +331,100 @@ static void deallocate(prte_job_t *jdata, prte_app_context_t *app)
 
 static void modify(prte_pmix_server_req_t *req)
 {
-    char *slurm_jobid;
+    int prte_err = PRTE_SUCCESS;
+    int pmix_err = PMIX_SUCCESS;
 
-    if (NULL == (slurm_jobid = getenv("SLURM_JOBID"))) {
-        req->pstatus = PMIX_ERROR;
-        return;
+    pmix_hash_table_t slurm_jobfields;
+    bool have_slurm_jobfields = false;
+
+    char *nodes_string = NULL;
+
+    if(PMIX_ALLOC_EXTEND == req->allocdir) {
+     
+        PMIX_CONSTRUCT(&slurm_jobfields, pmix_hash_table_t);
+
+        pmix_err = pmix_hash_table_init(&slurm_jobfields, total_fields_len);
+
+        if(PMIX_SUCCESS != pmix_err) {
+            goto cleanup;
+        }
+
+        prte_err = prte_ras_slurm_extract_job_fields(&slurm_jobfields);
+
+        if(PRTE_SUCCESS != prte_err) {
+
+            PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
+                                "%s ras:slurm:modify: failed to parse fields from current Slurm job",
+                                PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
+
+            goto cleanup;
+        }
+
+        uint32_t num_nodes;
+        bool found = false;
+
+        for (size_t i = 0; i < req->ninfo; ++i) {
+
+            if (0 == strcmp(info[i].key, PMIX_NUM_NODES)) {
+
+                if (info[i].value.type != PMIX_UINT32) {
+                    prte_err = PRTE_ERR_BAD_PARAM;
+                    goto cleanup;
+                }
+            }
+
+            num_nodes = req->info[i].value.data.uint32;
+            found = true;
+            break;
+        }
+
+        if(!found) {
+            PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
+                    "%s ras:slurm:modify: modify request invalid",
+                    PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
+
+            prte_err = PRTE_ERR_NOT_FOUND;
+            goto cleanup;
+        }
+
+        int rc = asprintf(&nodes_string, "%" PRIu32, num_nodes);
+        
+        if(0 > rc) {
+            prte_err = PRTE_ERR_OUT_OF_RESOURCE;
+            goto cleanup;
+        }
+
+        pmix_err = pmix_hash_table_set_value_ptr(&slurm_jobfields, prte_request_fields[PRTE_REQUEST_NODES],
+                                strlen(prte_request_fields[PRTE_REQUEST_NODES]), nodes_string);
+
+        if(PMIX_SUCCESS != pmix_err) {
+            goto cleanup;
+        }
+
+        prte_err = prte_ras_slurm_launch_expander_job(&slurm_jobfields);
+
+        if(PRTE_SUCCESS == prte_err) {
+            printf("Yippie, launched an expander job!\n");
+        }
     }
 
-    
+    cleanup:
+
+    free(nodes_string);
+
+    if(PMIX_SUCCESS != pmix_err) {
+        prte_err = prte_pmix_convert_rc(pmix_err);
+    }
+
+    if(prte_err != PRTE_SUCCESS) {
+        PRTE_ERROR_LOG(prte_err);
+    }
+
+    if(have_slurm_jobfields) {
+        prte_ras_slurm_wipe_dyn_hashtable(slurm_jobfields);
+
+        PMIX_DESTRUCT(slurm_jobfields);
+    }
 
     req->status = PMIX_ERR_NOT_SUPPORTED;
     return;
@@ -878,6 +1009,42 @@ static int prte_ras_slurm_skip_json_value(char **line)
     }
 }
 
+/**
+ * @brief Check whether a string contains characters that increase attack surface.
+ *
+ * Rejects the string if it contains any ASCII control characters, space,
+ * or characters that may trigger interpretation by downstream parsers
+ */
+static int prte_ras_slurm_string_is_safe(const char *s, bool *safe)
+{
+    if (NULL == s || NULL == safe) {
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    for (const unsigned char *p = (const unsigned char *)s; *p; ++p) {
+        unsigned char c = *p;
+
+        /* reject control characters */
+        if (c < 0x20 || c == 0x7f) {
+            *safe = false;
+        }
+
+        /* reject interpreter / metacharacters and space */
+        switch (c) {
+            case '"': case '\'': case '\\': case '`':
+            case '$': case ';': case '&':  case '|':
+            case '<': case '>': case '(': case ')':
+            case '{': case '}': case '[': case ']':
+            case '*': case '?': case '!': case ' ':
+                *safe = false;
+            default:
+                break;
+        }
+    }
+
+    return PRTE_SUCCESS;
+}
+
 /*
  * Parse a Slurm JSON-format input and extract a fixed set of expected keys
  *
@@ -1002,10 +1169,24 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
                     const char * start_text = open_quote+1;
                     size_t len = close_quote-start_text;
 
+                    /* maximum size limit for any field */
+                    if(len > 4096) {
+                        err = PRTE_ERR_BAD_PARAM;
+                        goto cleanup;
+                    }
+
                     val_ptr = strndup(start_text, len);
 
                     if(NULL == val_ptr) {
                         err = PRTE_ERR_OUT_OF_RESOURCE;
+                        goto cleanup;
+                    }
+
+                    bool safe = true;
+
+                    /* filter out some potentially malicious characters */
+                    if (PRTE_SUCCESS != prte_ras_slurm_string_is_safe(p, &safe) || !safe) {
+                        err = PRTE_ERR_BAD_PARAM;
                         goto cleanup;
                     }
 
@@ -1014,6 +1195,7 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
                 
                 /* numerical key */
                 else if(type_marker == num_marker) {
+                    
                     char *line_start = slurm_json;
                     size_t len = 0;
 
@@ -1272,8 +1454,6 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
         }
     }
 
-    /* todo: exclude fields based on MCA params */
-
     pmix_hash_table_t tmp_table;
     pmix_hash_table_t types_table;
 
@@ -1408,7 +1588,7 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
      * fields that have "set", "infinite", and "number" fields into a temporary
      * table which we can then process */
 
-    for(size_t i = 0; i < num_obj_fields_len && PMIX_SUCCESS == pmix_err; i++) {
+    for(size_t i = 0; i < NUM_OBJ_SUBFIELD_COUNT && PMIX_SUCCESS == pmix_err; i++) {
         pmix_err = pmix_hash_table_set_value_ptr(&types_table, num_obj_fields[i],
                                 strlen(num_obj_fields[i]), obj_marker);
     }
@@ -1423,7 +1603,7 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
         goto cleanup;
     }
 
-    for(size_t i = 0; i < num_obj_fields_len && PMIX_SUCCESS == pmix_err; i++) {
+    for(size_t i = 0; i < NUM_OBJ_SUBFIELD_COUNT && PMIX_SUCCESS == pmix_err; i++) {
         pmix_err = pmix_hash_table_remove_value_ptr(&types_table, num_obj_fields[i], strlen(num_obj_fields[i]));
     }
 
@@ -1434,7 +1614,7 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
 
     /* numbers in JSON object format: set, infinite, number 
      *  here, set the names of these subfields and their types */
-    for(size_t i = 0; i < num_obj_subfields_len && PMIX_SUCCESS == pmix_err; i++) {
+    for(size_t i = 0; i < NUM_OBJ_SUBFIELD_COUNT && PMIX_SUCCESS == pmix_err; i++) {
         pmix_err = pmix_hash_table_set_value_ptr(&types_table, num_obj_subfields[i],
                                 strlen(num_obj_subfields[i]), num_obj_subfield_types[i]);
     }
@@ -1444,7 +1624,7 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
         goto cleanup;
     }
 
-    for(size_t i = 0; i < num_obj_fields_len && PRTE_SUCCESS == err; i++) {
+    for(size_t i = 0; i < NUM_OBJ_SUBFIELD_COUNT && PRTE_SUCCESS == err; i++) {
 
         char *num_obj_field;
 
@@ -1466,29 +1646,29 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
         char *infinite;
         char *value;
 
-        pmix_err = pmix_hash_table_get_value_ptr(&tmp_table, "set",
-                                strlen("set"), (void**)&set);
+        pmix_err = pmix_hash_table_get_value_ptr(&tmp_table, num_obj_subfields[NUM_OBJ_SUBFIELD_SET],
+                                strlen(num_obj_subfields[NUM_OBJ_SUBFIELD_SET]), (void**)&set);
 
         if(PMIX_SUCCESS != pmix_err) {
             goto cleanup;
         }
 
-        pmix_err = pmix_hash_table_get_value_ptr(&tmp_table, "infinite",
-                                strlen("infinite"), (void**)&infinite);
+        pmix_err = pmix_hash_table_get_value_ptr(&tmp_table, num_obj_subfields[NUM_OBJ_SUBFIELD_INFINITE],
+                               num_obj_subfields[NUM_OBJ_SUBFIELD_INFINITE], (void**)&infinite);
 
         if(PMIX_SUCCESS != pmix_err) {
             goto cleanup;
         }
 
-        pmix_err = pmix_hash_table_get_value_ptr(&tmp_table, "number",
-                                strlen("number"), (void**)&value);
+        pmix_err = pmix_hash_table_get_value_ptr(&tmp_table, num_obj_subfields[NUM_OBJ_SUBFIELD_NUMBER],
+                                num_obj_subfields[NUM_OBJ_SUBFIELD_NUMBER], (void**)&value);
 
         if(PMIX_SUCCESS != pmix_err) {
             goto cleanup;
         }
 
         if(0 == strcmp(set, "false")) {
-            char *empty_dyn = strdup("");
+            char *empty_dyn = strdup(unset_num_marker);
 
             if(NULL == empty_dyn) {
                 err = PRTE_ERR_OUT_OF_RESOURCE;
@@ -1501,7 +1681,7 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
 
         else if(0 == strcmp(infinite, "true")) {
 
-            char *inf_dyn = strdup("inf");
+            char *inf_dyn = strdup(infinite_num_marker);
 
             if(NULL == inf_dyn) {
                 err = PRTE_ERR_OUT_OF_RESOURCE;
@@ -1540,14 +1720,9 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
 
     /* finally, find the string and numeric fields and add them to our value table */
 
-    for(size_t i = 0; i < str_fields_len && PMIX_SUCCESS == pmix_err; i++) {
+    for(size_t i = 0; i < STR_FIELD_COUNT && PMIX_SUCCESS == pmix_err; i++) {
         pmix_err = pmix_hash_table_set_value_ptr(&types_table, str_fields[i],
                               strlen(str_fields[i]), str_marker);
-    }
-
-    for(size_t i = 0; i < num_fields_len && PMIX_SUCCESS == pmix_err; i++) {
-        pmix_err = pmix_hash_table_set_value_ptr(&types_table, num_fields[i],
-                                strlen(num_fields[i]), num_marker);
     }
 
     if(PMIX_SUCCESS != pmix_err) {
@@ -1574,17 +1749,9 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
         pclose(fp);
     }
 
-    if(NULL != slurm_json) {
-        free(slurm_json);
-    }
-
-    if(NULL != jobs_json_obj) {
-        free(jobs_json_obj);
-    }
-
-    if(NULL != cmd) {
-        free(cmd);
-    }
+    free(slurm_json);
+    free(jobs_json_obj);
+    free(cmd);
 
     prte_ras_slurm_wipe_dyn_hashtable(&tmp_table);
 
@@ -1592,4 +1759,194 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
     PMIX_DESTRUCT(&types_table);
 
     return err;
+}
+
+static int prte_ras_slurm_make_job_field(pmix_hash_table_t const *fields, const char *field_name, const char *field_format, char **field_out, bool obj_num) {
+    
+    char *stored_val;
+
+    int pmix_err = pmix_hash_table_get_value_ptr(fields, field_name,
+                        strlen(field_name), (void**)&stored_val);
+
+    if(PMIX_SUCCESS != pmix_err || NULL == stored_val || 0 == strlen(stored_val)) {
+        return PRTE_ERR_NOT_FOUND;
+    }
+
+    if(obj_num) {
+        /* handle both as just unset for now */
+        if(0 == strcmp(stored_val, unset_num_marker)
+        || 0 == strcmp(stored_val, infinite_num_marker)) {
+            field_format = "%s";
+            stored_val = "";
+        }
+    }
+
+    int rc = asprintf(field_out, field_format, stored_val);
+
+    if(0 > rc) {
+        *field_out = NULL;
+        return PRTE_ERR_OUT_OF_RESOURCE;
+    }
+
+    return PRTE_SUCCESS;
+}
+
+static int prte_ras_slurm_launch_expander_job(pmix_hash_table_t const *fields) {
+
+    int prte_err = PRTE_SUCCESS;
+    int pmix_err = PMIX_SUCCESS;
+
+    char *account_field = NULL;
+    char *partition_field = NULL;
+    char *qos_field = NULL;
+    char *cwd_field = NULL;
+    char *mem_per_cpu_field = NULL;
+    char *mem_per_node_field = NULL;
+    char *time_limit_field = NULL;
+    char *nodes_field = NULL;
+
+    char *job_script = NULL;
+
+    char *base_script =
+    "#!/bin/bash\n"
+    "%s\n"
+    "%s\n"
+    "%s\n"
+    "%s\n"
+    "%s\n"
+    "%s\n"
+    "%s\n"
+    "%s\n"
+    "sleep infinity\n";
+
+    FILE *fp = NULL;
+    
+    prte_err = prte_ras_slurm_make_job_field(fields, str_fields[STR_ACCOUNT], account_format, &account_field, false);
+
+    if(PRTE_SUCCESS != prte_err) {
+        goto cleanup;
+    }
+
+    prte_err = prte_ras_slurm_make_job_field(fields, str_fields[STR_PARTITION], partition_format, &partition_field, false);
+
+    if(PRTE_SUCCESS != prte_err) {
+        goto cleanup;
+    }
+
+    prte_err = prte_ras_slurm_make_job_field(fields, str_fields[STR_QOS], qos_format, &qos_field, false);
+
+    if(PRTE_SUCCESS != prte_err) {
+        goto cleanup;
+    }
+
+    prte_err = prte_ras_slurm_make_job_field(fields, str_fields[STR_CWD], cwd_format, &cwd_field, false);
+
+    if(PRTE_SUCCESS != prte_err) {
+        goto cleanup;
+    }
+
+    prte_err = prte_ras_slurm_make_job_field(fields, prte_request_fields[PRTE_REQUEST_NODES], nodes_format, &nodes_field, false);
+
+    if(PRTE_SUCCESS != prte_err) {
+        goto cleanup;
+    }
+
+    /* todo: exclude based on MCA parameters */
+    prte_err = prte_ras_slurm_make_job_field(fields, num_obj_fields[NUM_OBJ_MEMORY_PER_CPU],
+                                            mem_per_cpu_format, &mem_per_cpu_field, true);
+
+    if (PRTE_SUCCESS != prte_err) {
+        goto cleanup;
+    }
+
+    if(0 == strlen(mem_per_cpu_field)) {
+        prte_err = prte_ras_slurm_make_job_field(fields, num_obj_fields[NUM_OBJ_MEMORY_PER_NODE],
+                                                mem_per_node_format, &mem_per_node_field, true);
+
+        if (PRTE_SUCCESS != prte_err) {
+            goto cleanup;
+        }
+    }
+    else {
+        mem_per_node_field = strdup("");
+        
+        if(NULL == mem_per_node_field) {
+            prte_err = PRTE_ERR_OUT_OF_RESOURCE;
+            goto cleanup;
+        }
+    }
+
+    prte_err = prte_ras_slurm_make_job_field(fields, num_obj_fields[NUM_OBJ_TIME_LIMIT],
+                                        time_format, &time_limit_field, true);
+
+    if (PRTE_SUCCESS != prte_err) {
+        goto cleanup;
+    }
+
+    int rc = asprintf(&job_script, base_script,
+    account_field,
+    partition_field,
+    qos_field,
+    cwd_field,
+    mem_per_cpu_field,
+    mem_per_node_field,
+    time_limit_field
+    );
+
+    if(0 > rc) {
+        prte_err = PRTE_ERR_OUT_OF_RESOURCE;
+        goto cleanup;
+    }
+
+    fp = popen("sbatch", "w");
+    if (NULL == fp) {
+        prte_err = PRTE_ERR_FILE_OPEN_FAILURE;
+        goto cleanup;
+    }
+
+    fputs(job_script, fp);
+
+    rc = pclose(fp);
+    fp = NULL;
+
+    if (WIFEXITED(rc)) {
+        int exit_code = WEXITSTATUS(rc);
+
+        if(0 != exit_code) {
+            PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
+                        "%s ras:slurm:launch_expander_job: job submission failed!",
+                        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
+            prte_err = PRTE_ERR_NOT_AVAILABLE;
+            goto cleanup;
+        }
+    }
+    else {
+        PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
+            "%s ras:slurm:launch_expander_job: job submission exited abnormally",
+            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
+        prte_err = PRTE_ERR_NOT_AVAILABLE;
+        goto cleanup;
+    }
+
+    cleanup:
+
+    if(NULL != fp) {
+        pclose(fp);
+    }
+
+    free(job_script);
+    
+    free(partition_field);
+    free(qos_field);
+    free(cwd_field);
+    free(mem_per_cpu_field);
+    free(mem_per_node_field);
+    free(time_limit_field);
+    free(account_field);
+
+    if(PRTE_SUCCESS != prte_err) {
+        PRTE_ERROR_LOG(prte_err);
+    }
+
+    return prte_err;
 }
