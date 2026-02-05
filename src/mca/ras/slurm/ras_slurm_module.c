@@ -879,6 +879,9 @@ static int prte_ras_slurm_find_next_delimited_obj(const char **str_in, char open
                 PRTE_ERROR_LOG(res);
                 return res;
             }
+            
+            /* cursor already advanced by prte_ras_slurm_find_next_quoted */
+            continue;
         }
 
         else if (open_ch == **str_in) {
@@ -891,6 +894,7 @@ static int prte_ras_slurm_find_next_delimited_obj(const char **str_in, char open
         else if (close_ch == **str_in) {
             bracket_counter--;
 
+        if('{' == **str_in || '}' == **str_in)
             if (0 > bracket_counter) {
                 PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
                 return PRTE_ERR_BAD_PARAM;
@@ -970,8 +974,7 @@ static int prte_ras_slurm_strip_json_whitespace(char *json_text)
  * @param line A pointer to the current position in a JSON string; updated
  *             to point past the skipped value
  */
-static int prte_ras_slurm_skip_json_value(const char **line)
-{
+static int prte_ras_slurm_skip_json_value(const char **line) {
     const char *start = *line;
     const char *end = NULL;
     int err;
@@ -979,22 +982,25 @@ static int prte_ras_slurm_skip_json_value(const char **line)
     switch (**line) {
     case '"':
         err = prte_ras_slurm_find_next_quoted(line, &start, &end);
-        if (PRTE_SUCCESS != err) return err;
-        *line = (char *)end + 1;
+        if (PRTE_SUCCESS != err) {
+            return err;
+        } 
         return PRTE_SUCCESS;
 
     case '{':
         err = prte_ras_slurm_find_next_delimited_obj(
             line, '{', '}', &start, &end);
-        if (PRTE_SUCCESS != err) return err;
-        *line = (char *)end + 1;
+        if (PRTE_SUCCESS != err) {
+            return err;
+        } 
         return PRTE_SUCCESS;
 
     case '[':
         err = prte_ras_slurm_find_next_delimited_obj(
             line, '[', ']', &start, &end);
-        if (PRTE_SUCCESS != err) return err;
-        *line = (char *)end + 1;
+        if (PRTE_SUCCESS != err) {
+            return err;
+        }
         return PRTE_SUCCESS;
 
     default:
@@ -1088,7 +1094,7 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
 
     const char *json_cursor = slurm_json;
 
-    while('\0' != *json_cursor && expected_count > count_found) {
+    while('\0' != *json_cursor && expected_count > count_found || STATE_SET == parse_state) {
 
         switch(parse_state) {
             
@@ -1144,6 +1150,7 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
 
                         err = prte_ras_slurm_skip_json_value(&json_cursor);
                         if (PRTE_SUCCESS != err) {
+                            PRTE_ERROR_LOG(err);
                             goto cleanup;
                         }
 
@@ -1157,12 +1164,14 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
                     /* expected a string and only a string */
                     if(*json_cursor != '"') {
                         err = PRTE_ERR_NOT_FOUND;
+                        PRTE_ERROR_LOG(err);
                         goto cleanup; 
                     }
 
                     err = prte_ras_slurm_find_next_quoted(&json_cursor, &open_quote, &close_quote);
         
                     if(PRTE_SUCCESS != err) {
+                        PRTE_ERROR_LOG(err);
                         goto cleanup; 
                     }
 
@@ -1179,6 +1188,7 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
 
                     if(NULL == val_ptr) {
                         err = PRTE_ERR_OUT_OF_RESOURCE;
+                        PRTE_ERROR_LOG(err);
                         goto cleanup;
                     }
 
@@ -1187,28 +1197,28 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
                     /* filter out some potentially malicious characters */
                     if (PRTE_SUCCESS != prte_ras_slurm_string_is_safe(val_ptr, &safe) || !safe) {
                         err = PRTE_ERR_BAD_PARAM;
+                        PRTE_ERROR_LOG(err);
                         goto cleanup;
                     }
 
                     parse_state = STATE_SET;
                 }
                 
-                /* numerical key */
+                /* numeric key */
                 else if(type_marker == num_marker) {
-                    
                     const char *line_start = json_cursor;
                     size_t len = 0;
 
-                    /* numeric key */
+                    /* might need to be loosened in the future, but OK restriction for now */
                     while (isdigit((unsigned char)*json_cursor)) {
                         len++;
                         json_cursor++;
                     }
 
                     /* started with some unexpected character */
-                    if(0 == len)
-                    {
+                    if(0 == len) {
                         err = PRTE_ERR_NOT_FOUND;
+                        PRTE_ERROR_LOG(err);
                         goto cleanup; 
                     }
                     
@@ -1216,16 +1226,16 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
 
                     if(NULL == val_ptr) {
                         err = PRTE_ERR_OUT_OF_RESOURCE;
+                        PRTE_ERROR_LOG(err);
                         goto cleanup;
                     }
 
                     parse_state = STATE_SET;
-
                 }
 
                 /* boolean type */
                 else if(type_marker == bool_marker) {
-
+                    
                     /* technically, a value like trueX would be accepted here,
                     * but the goal is not a fully compliant parser; we expect
                     * the Slurm output to be well behaved */
@@ -1244,16 +1254,19 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
 
                     else {
                         err = PRTE_ERR_NOT_FOUND;
+                        PRTE_ERROR_LOG(err);
                         goto cleanup;
                     }
                     
-                    key_ptr = strdup(val);
+                    val_ptr = strdup(val);
 
                     if(NULL == val_ptr) {
                         err = PRTE_ERR_OUT_OF_RESOURCE;
+                        PRTE_ERROR_LOG(err);
                         goto cleanup;
                     }
 
+                    parse_state = STATE_SET;
                 }
 
                 /* JSON object key */
@@ -1261,6 +1274,7 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
                     
                     if(*json_cursor != '{') {
                         err = PRTE_ERR_NOT_FOUND;
+                        PRTE_ERROR_LOG(err);
                         goto cleanup;
                     }
 
@@ -1270,6 +1284,7 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
                     err = prte_ras_slurm_find_next_delimited_obj(&json_cursor, '{', '}', &obj_start, &obj_end);
 
                     if(PRTE_SUCCESS != err) {
+                        PRTE_ERROR_LOG(err);
                         goto cleanup;   
                     }
 
@@ -1280,6 +1295,7 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
 
                     if(NULL == val_ptr) {
                         err = PRTE_ERR_OUT_OF_RESOURCE;
+                        PRTE_ERROR_LOG(err);
                         goto cleanup;
                     }
                     
@@ -1291,6 +1307,7 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
 
                     if(*json_cursor != '[') {
                         err = PRTE_ERR_NOT_FOUND;
+                        PRTE_ERROR_LOG(err);
                         goto cleanup;
                     }
 
@@ -1300,6 +1317,7 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
                     err = prte_ras_slurm_find_next_delimited_obj(&json_cursor, '[', ']', &arr_start, &arr_end);
 
                     if(PRTE_SUCCESS != err) {
+                        PRTE_ERROR_LOG(err);
                         goto cleanup;   
                     }
 
@@ -1311,12 +1329,14 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
                     err = prte_ras_slurm_find_next_delimited_obj(&json_cursor, '{', '}', &obj_start, &obj_end);
 
                     if(PRTE_SUCCESS != err) {
+                        PRTE_ERROR_LOG(err);
                         goto cleanup;   
                     }
 
                     /* we expect this structure [{object1}] when stripped of whitespace */
-                    if(arr_start != obj_start+1 || obj_end != arr_end-1) {
+                    if(obj_start != arr_start+1 || arr_end != obj_end+1) {
                         err = PRTE_ERR_NOT_FOUND;
+                        PRTE_ERROR_LOG(err);
                         goto cleanup;
                     }
 
@@ -1336,12 +1356,14 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
                 /* unknown or unexpected type */ 
                 else {
                     err = PRTE_ERR_BAD_PARAM;
+                    PRTE_ERROR_LOG(err);
                     goto cleanup;
                 }
 
                 break;
             }
 
+            /* NOTE: json_cursor may be out of bounds here !! */
             case STATE_SET: {
 
                 void *existing;
@@ -1354,9 +1376,14 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
 
                     if(PMIX_SUCCESS != pmix_err) {
                         err = prte_pmix_convert_rc(pmix_err);
+                        PRTE_ERROR_LOG(err);
                         goto cleanup;
                     }
 
+                    PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
+                    "%s ras:slurm:match_json_entries: found match for %s",
+                    PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), key_ptr));
+                    
                     /* do not free as pointer is in in hash table */
                     val_ptr = NULL;
 
@@ -1367,6 +1394,9 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
                     count_found++;
 
                 } else {
+                    PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
+                    "%s ras:slurm:match_json_entries: ignoring duplicate key %s",
+                    PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), key_ptr));
                     /* duplicates */
                     free(key_ptr);
                     free(val_ptr);
@@ -1383,18 +1413,18 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
     }
 
     if(expected_count != count_found) {
+        PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
+            "%s ras:slurm:match_json_entries: found %d entries but expected %d",
+            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), count_found, expected_count));
         err = PRTE_ERR_NOT_FOUND;
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
     }
 
     cleanup:
 
-    if(key_ptr) {
-        free(key_ptr);
-    }
-
-    if(val_ptr) {
-        free(val_ptr);
-    }
+    free(key_ptr);
+    free(val_ptr);
 
     return err;
 }
@@ -1494,7 +1524,9 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
     if(PMIX_SUCCESS != pmix_err) {
         PMIX_DESTRUCT(&types_table);
         PMIX_DESTRUCT(&tmp_table);
-        return prte_pmix_convert_rc(pmix_err);
+        err = prte_pmix_convert_rc(pmix_err);
+        PRTE_ERROR_LOG(err);
+        return err;
     }
 
     /* TODO: how about Slurm-side errors */
@@ -1504,6 +1536,7 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
     if(0 > asprintf(&cmd, cmd_format, slurm_jobid)) {
         cmd = NULL;
         err = PRTE_ERR_OUT_OF_RESOURCE;
+        PRTE_ERROR_LOG(err);
         goto cleanup;
     }
 
@@ -1511,6 +1544,7 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
 
     if(!fp) {
         err = PRTE_ERR_FILE_OPEN_FAILURE;
+        PRTE_ERROR_LOG(err);
         goto cleanup;
     }
 
@@ -1521,6 +1555,7 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
 
     if (!slurm_json) {
         err = PRTE_ERR_OUT_OF_RESOURCE;
+        PRTE_ERROR_LOG(err);
         goto cleanup;
     }
 
@@ -1533,12 +1568,14 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
 
             if(curr_limit > PRTE_SLURM_JOB_INFO_MAX_SIZE) {
                 err = PRTE_ERR_MEM_LIMIT_EXCEEDED;
+                PRTE_ERROR_LOG(err);
                 goto cleanup;
             }
 
             char *tmp = realloc(slurm_json, curr_limit);
             if (!tmp) {
                 err = PRTE_ERR_OUT_OF_RESOURCE;
+                PRTE_ERROR_LOG(err);
                 goto cleanup;
             }
 
@@ -1556,6 +1593,7 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
 
     if(0 == strlen(slurm_json)) {
         err = PRTE_ERR_NOT_FOUND;
+        PRTE_ERROR_LOG(err);
         goto cleanup;
     }
 
@@ -1569,12 +1607,14 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
 
     if(PMIX_SUCCESS != pmix_err) {
         err = prte_pmix_convert_rc(pmix_err);
+        PRTE_ERROR_LOG(err);
         goto cleanup;
     }
 
     err = prte_ras_slurm_match_json_entries(&types_table, &tmp_table, slurm_json);
 
     if(PRTE_SUCCESS != err) {
+        PRTE_ERROR_LOG(err);
         goto cleanup;
     }
 
@@ -1584,12 +1624,16 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
                                         strlen(jobs_field), (void**)&jobs_json_obj_val);
     
     if(PMIX_SUCCESS != pmix_err) {
+        err = prte_pmix_convert_rc(pmix_err);
+        PRTE_ERROR_LOG(err);
         goto cleanup;
     }
     
     pmix_err = pmix_hash_table_remove_value_ptr(&types_table, jobs_field, strlen(jobs_field));
 
     if(PMIX_SUCCESS != pmix_err) {
+        err = prte_pmix_convert_rc(pmix_err);
+        PRTE_ERROR_LOG(err);
         goto cleanup;
     }
 
@@ -1598,6 +1642,7 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
 
     if(NULL == jobs_json_obj) {
         err = PRTE_ERR_OUT_OF_RESOURCE;
+        PRTE_ERROR_LOG(err);
         goto cleanup;
     }
 
@@ -1611,12 +1656,15 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
     }
 
     if(PMIX_SUCCESS != pmix_err) {
+        err = prte_pmix_convert_rc(pmix_err);
+        PRTE_ERROR_LOG(err);
         goto cleanup;
     }
 
     err = prte_ras_slurm_match_json_entries(&types_table, &tmp_table, jobs_json_obj);
 
     if(PRTE_SUCCESS != err) {
+        PRTE_ERROR_LOG(err);
         goto cleanup;
     }
 
@@ -1626,6 +1674,7 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
 
     if(PMIX_SUCCESS != pmix_err) {
         err = prte_pmix_convert_rc(pmix_err);
+        PRTE_ERROR_LOG(err);
         goto cleanup;
     }
 
@@ -1638,6 +1687,7 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
 
     if(PMIX_SUCCESS != pmix_err) {
         err = prte_pmix_convert_rc(pmix_err);
+        PRTE_ERROR_LOG(err);
         goto cleanup;
     }
 
@@ -1650,12 +1700,14 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
 
         if(PMIX_SUCCESS != pmix_err) {
             err = prte_pmix_convert_rc(pmix_err);
+            PRTE_ERROR_LOG(err);
             goto cleanup;
         }
 
         err = prte_ras_slurm_match_json_entries(&types_table, &tmp_table, num_obj_field);
         
         if(PRTE_SUCCESS != err) {
+            PRTE_ERROR_LOG(err);
             goto cleanup;
         }
 
@@ -1667,6 +1719,8 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
                                 strlen(num_obj_subfields[NUM_OBJ_SUBFIELD_SET]), (void**)&set);
 
         if(PMIX_SUCCESS != pmix_err) {
+            err = prte_pmix_convert_rc(pmix_err);
+            PRTE_ERROR_LOG(err);
             goto cleanup;
         }
 
@@ -1674,6 +1728,8 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
                                strlen(num_obj_subfields[NUM_OBJ_SUBFIELD_INFINITE]), (void**)&infinite);
 
         if(PMIX_SUCCESS != pmix_err) {
+            err = prte_pmix_convert_rc(pmix_err);
+            PRTE_ERROR_LOG(err);
             goto cleanup;
         }
 
@@ -1681,6 +1737,8 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
                                 strlen(num_obj_subfields[NUM_OBJ_SUBFIELD_NUMBER]), (void**)&value);
 
         if(PMIX_SUCCESS != pmix_err) {
+            err = prte_pmix_convert_rc(pmix_err);
+            PRTE_ERROR_LOG(err);
             goto cleanup;
         }
 
@@ -1694,6 +1752,11 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
 
             pmix_err = pmix_hash_table_set_value_ptr(values_table, num_obj_fields[i],
                         strlen(num_obj_fields[i]), empty_dyn);
+
+            if(PMIX_SUCCESS != pmix_err) {
+                err = prte_pmix_convert_rc(pmix_err);
+                PRTE_ERROR_LOG(err);
+            }
         }
 
         else if(0 == strcmp(infinite, "true")) {
@@ -1702,6 +1765,7 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
 
             if(NULL == inf_dyn) {
                 err = PRTE_ERR_OUT_OF_RESOURCE;
+                PRTE_ERROR_LOG(err);
                 goto cleanup;
             }
 
@@ -1714,6 +1778,7 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
 
             if(NULL == val_dup) {
                 err = PRTE_ERR_OUT_OF_RESOURCE;
+                PRTE_ERROR_LOG(err);
                 goto cleanup;
             }
 
@@ -1722,6 +1787,8 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
         }
 
         if(PMIX_SUCCESS != pmix_err) {
+            err = prte_pmix_convert_rc(pmix_err);
+            PRTE_ERROR_LOG(err);
             goto cleanup;
         }
 
@@ -1729,6 +1796,7 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
         err = prte_ras_slurm_wipe_dyn_hashtable(&tmp_table);
 
         if(PRTE_SUCCESS != err) {
+            PRTE_ERROR_LOG(err);
             goto cleanup;
         }
     }
@@ -1743,24 +1811,19 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
     }
 
     if(PMIX_SUCCESS != pmix_err) {
+        err = prte_pmix_convert_rc(pmix_err);
+        PRTE_ERROR_LOG(err);
         goto cleanup;
     }
 
     err = prte_ras_slurm_match_json_entries(&types_table, values_table, jobs_json_obj);
 
     if(PRTE_SUCCESS != err) {
+        PRTE_ERROR_LOG(err);
         goto cleanup;
     }
 
     cleanup:
-
-    if(PMIX_SUCCESS != pmix_err) {
-        err = prte_pmix_convert_rc(pmix_err);
-    }
-
-    if(PRTE_SUCCESS != err) {
-        PRTE_ERROR_LOG(err);
-    }
 
     if(NULL != fp) {
         pclose(fp);
