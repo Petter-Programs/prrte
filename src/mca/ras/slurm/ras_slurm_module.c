@@ -89,16 +89,16 @@ prte_ras_base_module_t prte_ras_slurm_module = {
 static int prte_ras_slurm_discover(char *regexp, char *tasks_per_node, pmix_list_t *nodelist);
 static int prte_ras_slurm_parse_ranges(char *base, char *ranges, char ***nodelist);
 static int prte_ras_slurm_parse_range(char *base, char *range, char ***nodelist);
-static int prte_ras_slurm_find_next_quoted(const char *str_in, const char **start_entry, const char **end_entry);
-static int prte_ras_slurm_find_next_delimited_obj(const char **str_in, const char **start_obj, const char **end_obj);
+static int prte_ras_slurm_find_next_quoted(const char **str_in, const char **start_quote, const char **end_quote);
+static int prte_ras_slurm_find_next_delimited_obj(const char **str_in, char open_ch, char close_ch, const char **start_obj, const char **end_obj);
 static int prte_ras_slurm_strip_json_whitespace(char *json_text);
-static int prte_ras_slurm_skip_json_value(char **line);
+static int prte_ras_slurm_skip_json_value(const char **line);
 static int prte_ras_slurm_string_is_safe(const char *s, bool *safe);
 static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix_hash_table_t* val_table, char *slurm_json);
 static int prte_ras_slurm_wipe_dyn_hashtable(pmix_hash_table_t *table);
 static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table);
-static int prte_ras_slurm_make_job_field(pmix_hash_table_t const *fields, const char *field_name, const char *field_format, char **field_out, bool obj_num);
-static int prte_ras_slurm_launch_expander_job(pmix_hash_table_t const *fields);
+static int prte_ras_slurm_make_job_field(pmix_hash_table_t *fields, const char *field_name, const char *field_format, char **field_out, bool obj_num);
+static int prte_ras_slurm_launch_expander_job(pmix_hash_table_t *fields);
 
 /* Slurm sbatch formats */
 static const char *account_format   = "#SBATCH --account=%s\n";
@@ -365,9 +365,9 @@ static void modify(prte_pmix_server_req_t *req)
 
         for (size_t i = 0; i < req->ninfo; ++i) {
 
-            if (0 == strcmp(info[i].key, PMIX_NUM_NODES)) {
+            if (0 == strcmp(req->info[i].key, PMIX_NUM_NODES)) {
 
-                if (info[i].value.type != PMIX_UINT32) {
+                if (req->info[i].value.type != PMIX_UINT32) {
                     prte_err = PRTE_ERR_BAD_PARAM;
                     goto cleanup;
                 }
@@ -395,7 +395,7 @@ static void modify(prte_pmix_server_req_t *req)
         }
 
         pmix_err = pmix_hash_table_set_value_ptr(&slurm_jobfields, prte_request_fields[PRTE_REQUEST_NODES],
-                                strlen(prte_request_fields[PRTE_REQUEST_NODES]), nodes_string);
+                                strlen(prte_request_fields[PRTE_REQUEST_NODES]), (void*)nodes_string);
 
         if(PMIX_SUCCESS != pmix_err) {
             goto cleanup;
@@ -421,9 +421,9 @@ static void modify(prte_pmix_server_req_t *req)
     }
 
     if(have_slurm_jobfields) {
-        prte_ras_slurm_wipe_dyn_hashtable(slurm_jobfields);
+        prte_ras_slurm_wipe_dyn_hashtable(&slurm_jobfields);
 
-        PMIX_DESTRUCT(slurm_jobfields);
+        PMIX_DESTRUCT(&slurm_jobfields);
     }
 
     req->status = PMIX_ERR_NOT_SUPPORTED;
@@ -874,7 +874,7 @@ static int prte_ras_slurm_find_next_delimited_obj(const char **str_in, char open
         /* ignore any quoted area for counting delimiters */
         if ('"' == **str_in) {
             int res = prte_ras_slurm_find_next_quoted(
-                &str_in, &next_quote_start, &next_quote_end);
+                str_in, &next_quote_start, &next_quote_end);
             if (PRTE_SUCCESS != res) {
                 PRTE_ERROR_LOG(res);
                 return res;
@@ -970,7 +970,7 @@ static int prte_ras_slurm_strip_json_whitespace(char *json_text)
  * @param line A pointer to the current position in a JSON string; updated
  *             to point past the skipped value
  */
-static int prte_ras_slurm_skip_json_value(char **line)
+static int prte_ras_slurm_skip_json_value(const char **line)
 {
     const char *start = *line;
     const char *end = NULL;
@@ -1069,9 +1069,7 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
     }
 
     int count_found = 0;
-    int expected_count;
-
-    pmix_hash_table_get_size(type_table, &expected_count);
+    size_t expected_count = pmix_hash_table_get_size(type_table);
 
     int pmix_err = PMIX_SUCCESS;
     int err = PRTE_SUCCESS;
@@ -1088,14 +1086,16 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
     /* remove any whitespace or linebreaks, as JSON does too */
     prte_ras_slurm_strip_json_whitespace(slurm_json);
 
-    while('\0' != *slurm_json && expected_count > count_found) {
+    const char *json_cursor = slurm_json;
+
+    while('\0' != *json_cursor && expected_count > count_found) {
 
         switch(parse_state) {
             
             /* look for keys in unescaped quotes */
             case STATE_KEY: {
 
-                if(PRTE_SUCCESS == prte_ras_slurm_find_next_quoted(&slurm_json, &open_quote, &close_quote)) {
+                if(PRTE_SUCCESS == prte_ras_slurm_find_next_quoted(&json_cursor, &open_quote, &close_quote)) {
 
                     const char * start_text = open_quote+1;
                     size_t len = close_quote - start_text;
@@ -1119,12 +1119,12 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
 
             /* look for colon following a potential key */
             case STATE_COLON: {
-                if(*slurm_json == ':') {
+                if(*json_cursor == ':') {
                     parse_state = STATE_VAL;
                 } else {
                     parse_state = STATE_KEY;
                 }
-                slurm_json++;
+                json_cursor++;
                 break;
             }
 
@@ -1142,7 +1142,7 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
                         free(key_ptr);
                         key_ptr = NULL;
 
-                        err = prte_ras_slurm_skip_json_value(&slurm_json);
+                        err = prte_ras_slurm_skip_json_value(&json_cursor);
                         if (PRTE_SUCCESS != err) {
                             goto cleanup;
                         }
@@ -1155,12 +1155,12 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
                 if(type_marker == str_marker) {
 
                     /* expected a string and only a string */
-                    if(*slurm_json != '"') {
+                    if(*json_cursor != '"') {
                         err = PRTE_ERR_NOT_FOUND;
                         goto cleanup; 
                     }
 
-                    err = prte_ras_slurm_find_next_quoted(&slurm_json, &open_quote, &close_quote);
+                    err = prte_ras_slurm_find_next_quoted(&json_cursor, &open_quote, &close_quote);
         
                     if(PRTE_SUCCESS != err) {
                         goto cleanup; 
@@ -1185,7 +1185,7 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
                     bool safe = true;
 
                     /* filter out some potentially malicious characters */
-                    if (PRTE_SUCCESS != prte_ras_slurm_string_is_safe(p, &safe) || !safe) {
+                    if (PRTE_SUCCESS != prte_ras_slurm_string_is_safe(val_ptr, &safe) || !safe) {
                         err = PRTE_ERR_BAD_PARAM;
                         goto cleanup;
                     }
@@ -1196,13 +1196,13 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
                 /* numerical key */
                 else if(type_marker == num_marker) {
                     
-                    char *line_start = slurm_json;
+                    const char *line_start = json_cursor;
                     size_t len = 0;
 
                     /* numeric key */
-                    while (isdigit((unsigned char)*slurm_json)) {
+                    while (isdigit((unsigned char)*json_cursor)) {
                         len++;
-                        slurm_json++;
+                        json_cursor++;
                     }
 
                     /* started with some unexpected character */
@@ -1232,14 +1232,14 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
 
                     char *val;
                     
-                    if(0 == strncmp(slurm_json, "true", 4)) {
+                    if(0 == strncmp(json_cursor, "true", 4)) {
                         val = "true";
-                        slurm_json+=4;
+                        json_cursor+=4;
                     }
 
-                    else if(0 == strncmp(slurm_json, "false", 5)) {
+                    else if(0 == strncmp(json_cursor, "false", 5)) {
                         val = "false";
-                        slurm_json+=5;
+                        json_cursor+=5;
                     }
 
                     else {
@@ -1259,7 +1259,7 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
                 /* JSON object key */
                 else if(type_marker == obj_marker) {
                     
-                    if(*slurm_json != '{') {
+                    if(*json_cursor != '{') {
                         err = PRTE_ERR_NOT_FOUND;
                         goto cleanup;
                     }
@@ -1267,7 +1267,7 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
                     const char *obj_start = NULL;
                     const char *obj_end = NULL;
                     
-                    err = prte_ras_slurm_find_next_delimited_obj(&slurm_json, '{', '}', &obj_start, &obj_end);
+                    err = prte_ras_slurm_find_next_delimited_obj(&json_cursor, '{', '}', &obj_start, &obj_end);
 
                     if(PRTE_SUCCESS != err) {
                         goto cleanup;   
@@ -1289,7 +1289,7 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
                 /* array containing a single JSON object */
                 else if(type_marker == arr_obj_marker) {
 
-                    if(*slurm_json != '[') {
+                    if(*json_cursor != '[') {
                         err = PRTE_ERR_NOT_FOUND;
                         goto cleanup;
                     }
@@ -1297,18 +1297,18 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
                     const char *arr_start = NULL;
                     const char *arr_end = NULL;
                     
-                    err = prte_ras_slurm_find_next_delimited_obj(&slurm_json, '[', ']', &arr_start, &arr_end);
+                    err = prte_ras_slurm_find_next_delimited_obj(&json_cursor, '[', ']', &arr_start, &arr_end);
 
                     if(PRTE_SUCCESS != err) {
                         goto cleanup;   
                     }
 
-                    slurm_json = arr_start+1;
+                    json_cursor = arr_start+1;
 
                     const char *obj_start = NULL;
                     const char *obj_end = NULL;
 
-                    err = prte_ras_slurm_find_next_delimited_obj(&slurm_json, '{', '}', &obj_start, &obj_end);
+                    err = prte_ras_slurm_find_next_delimited_obj(&json_cursor, '{', '}', &obj_start, &obj_end);
 
                     if(PRTE_SUCCESS != err) {
                         goto cleanup;   
@@ -1350,7 +1350,7 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
                 if (PMIX_SUCCESS != pmix_hash_table_get_value_ptr(val_table, key_ptr,
                                          strlen(key_ptr), (void**)&existing)) {
                     
-                    pmix_err = pmix_hash_table_set_value_ptr(val_table, key_ptr, strlen(key_ptr), val_ptr);
+                    pmix_err = pmix_hash_table_set_value_ptr(val_table, key_ptr, strlen(key_ptr), (void*)val_ptr);
 
                     if(PMIX_SUCCESS != pmix_err) {
                         err = prte_pmix_convert_rc(pmix_err);
@@ -1411,15 +1411,32 @@ static int prte_ras_slurm_match_json_entries(pmix_hash_table_t* type_table, pmix
  * @param table Pointer to the PMIx hash table to be wiped.
  */
 static int prte_ras_slurm_wipe_dyn_hashtable(pmix_hash_table_t *table) {
-    pmix_hash_element_t *elt = NULL;
-    void *node = NULL;
+
+    void *key;
+    size_t key_size;
+    void *val;
+    void *prev_node;
+    void *node;
+
+    int pmix_err;
+
+    pmix_err = pmix_hash_table_get_first_key_ptr(table, &key, &key_size, &val, &node);
+
+    if(PMIX_SUCCESS != pmix_err) {
+        return prte_pmix_convert_rc(pmix_err);
+    }
+    
+    free(val);
+    prev_node = node;
 
     while (PMIX_SUCCESS ==
-        pmix_hash_table_get_next_elt(table, elt, &elt)) {
-        free(elt->value);
+        pmix_hash_table_get_next_key_ptr(table, &key, &key_size, &val, &prev_node, &node)) {
+        free(val);
+        prev_node = node;
     }
-    err = pmix_hash_table_remove_all(table);
-    return prte_pmix_convert_rc(err);
+
+    pmix_err = pmix_hash_table_remove_all(table);
+    return prte_pmix_convert_rc(pmix_err);
 }
 
 static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
@@ -1548,7 +1565,7 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
      * inside an array structure, and would fail if there is more */
 
     pmix_err = pmix_hash_table_set_value_ptr(&types_table, jobs_field,
-                            strlen(jobs_field), arr_obj_marker);
+                            strlen(jobs_field), (void*)arr_obj_marker);
 
     if(PMIX_SUCCESS != pmix_err) {
         err = prte_pmix_convert_rc(pmix_err);
@@ -1590,7 +1607,7 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
 
     for(size_t i = 0; i < NUM_OBJ_SUBFIELD_COUNT && PMIX_SUCCESS == pmix_err; i++) {
         pmix_err = pmix_hash_table_set_value_ptr(&types_table, num_obj_fields[i],
-                                strlen(num_obj_fields[i]), obj_marker);
+                                strlen(num_obj_fields[i]), (void*)obj_marker);
     }
 
     if(PMIX_SUCCESS != pmix_err) {
@@ -1616,7 +1633,7 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
      *  here, set the names of these subfields and their types */
     for(size_t i = 0; i < NUM_OBJ_SUBFIELD_COUNT && PMIX_SUCCESS == pmix_err; i++) {
         pmix_err = pmix_hash_table_set_value_ptr(&types_table, num_obj_subfields[i],
-                                strlen(num_obj_subfields[i]), num_obj_subfield_types[i]);
+                                strlen(num_obj_subfields[i]), (void*)num_obj_subfield_types[i]);
     }
 
     if(PMIX_SUCCESS != pmix_err) {
@@ -1654,14 +1671,14 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
         }
 
         pmix_err = pmix_hash_table_get_value_ptr(&tmp_table, num_obj_subfields[NUM_OBJ_SUBFIELD_INFINITE],
-                               num_obj_subfields[NUM_OBJ_SUBFIELD_INFINITE], (void**)&infinite);
+                               strlen(num_obj_subfields[NUM_OBJ_SUBFIELD_INFINITE]), (void**)&infinite);
 
         if(PMIX_SUCCESS != pmix_err) {
             goto cleanup;
         }
 
         pmix_err = pmix_hash_table_get_value_ptr(&tmp_table, num_obj_subfields[NUM_OBJ_SUBFIELD_NUMBER],
-                                num_obj_subfields[NUM_OBJ_SUBFIELD_NUMBER], (void**)&value);
+                                strlen(num_obj_subfields[NUM_OBJ_SUBFIELD_NUMBER]), (void**)&value);
 
         if(PMIX_SUCCESS != pmix_err) {
             goto cleanup;
@@ -1722,7 +1739,7 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
 
     for(size_t i = 0; i < STR_FIELD_COUNT && PMIX_SUCCESS == pmix_err; i++) {
         pmix_err = pmix_hash_table_set_value_ptr(&types_table, str_fields[i],
-                              strlen(str_fields[i]), str_marker);
+                              strlen(str_fields[i]), (void*)str_marker);
     }
 
     if(PMIX_SUCCESS != pmix_err) {
@@ -1761,7 +1778,7 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
     return err;
 }
 
-static int prte_ras_slurm_make_job_field(pmix_hash_table_t const *fields, const char *field_name, const char *field_format, char **field_out, bool obj_num) {
+static int prte_ras_slurm_make_job_field(pmix_hash_table_t *fields, const char *field_name, const char *field_format, char **field_out, bool obj_num) {
     
     char *stored_val;
 
@@ -1791,7 +1808,7 @@ static int prte_ras_slurm_make_job_field(pmix_hash_table_t const *fields, const 
     return PRTE_SUCCESS;
 }
 
-static int prte_ras_slurm_launch_expander_job(pmix_hash_table_t const *fields) {
+static int prte_ras_slurm_launch_expander_job(pmix_hash_table_t *fields) {
 
     int prte_err = PRTE_SUCCESS;
     int pmix_err = PMIX_SUCCESS;
