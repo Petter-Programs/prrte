@@ -409,6 +409,9 @@ const char *prte_strerror(int errnum)
     case PRTE_ERR_CONDUIT_SEND_FAIL:
         retval = " Transport Conduit returned send error";
         break;
+    case PRTE_ERR_JSON_PARSE_FAILURE:
+        retval = "Failed to parse input JSON";
+        break;
     default:
         retval = "Unknown error";
     }

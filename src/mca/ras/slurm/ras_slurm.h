@@ -16,6 +16,8 @@
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
  * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2026      Barcelona Supercomputing Center (BSC-CNS).
+ *                         All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -40,6 +42,13 @@ typedef struct {
     prte_ras_base_component_t super;
     int max_length;
     bool use_all;
+    bool propagate_account;
+    bool propagate_partition;
+    bool propagate_qos;
+    bool propagate_cwd;
+    bool propagate_mem_per_cpu;
+    bool propagate_mem_per_node;
+    bool propagate_time;
 } prte_mca_ras_slurm_component_t;
 PRTE_EXPORT extern prte_mca_ras_slurm_component_t prte_mca_ras_slurm_component;
 

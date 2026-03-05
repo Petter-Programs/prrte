@@ -14,6 +14,8 @@
  * Copyright (c) 2015-2019 Intel, Inc.  All rights reserved.
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
  * Copyright (c) 2021      Nanook Consulting.  All rights reserved.
+ * Copyright (c) 2026      Barcelona Supercomputing Center (BSC-CNS).
+ *                         All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -113,7 +115,7 @@ enum {
     PRTE_OPERATION_SUCCEEDED = (PRTE_ERR_BASE - 72),
 
     /* error codes specific to PRTE - don't forget to update
-        src/util/error_strings.c when adding new error codes!!
+        src/util/error.c when adding new error codes!!
         Otherwise, the error reporting system will potentially crash,
         or at the least not be able to report the new error correctly.
      */
@@ -166,7 +168,8 @@ enum {
     PRTE_ERR_OUT_OF_ORDER_MSG = (PRTE_ERR_SPLIT - 48),
     PRTE_ERR_FORCE_SELECT = (PRTE_ERR_SPLIT - 49),
     PRTE_ERR_JOB_CANCELLED = (PRTE_ERR_SPLIT - 50),
-    PRTE_ERR_CONDUIT_SEND_FAIL = (PRTE_ERR_SPLIT - 51)
+    PRTE_ERR_CONDUIT_SEND_FAIL = (PRTE_ERR_SPLIT - 51),
+    PRTE_ERR_JSON_PARSE_FAILURE = (PRTE_ERR_SPLIT - 52)
 };
 
 #define PRTE_ERR_MAX (PRTE_ERR_SPLIT - 100)
