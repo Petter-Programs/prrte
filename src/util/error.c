@@ -412,6 +412,9 @@ const char *prte_strerror(int errnum)
     case PRTE_ERR_JSON_PARSE_FAILURE:
         retval = "Failed to parse input JSON";
         break;
+    case PRTE_ERR_SLURM_SUBMIT_FAILURE:
+        retval = "Request for new resources from Slurm failed";
+        break;
     default:
         retval = "Unknown error";
     }

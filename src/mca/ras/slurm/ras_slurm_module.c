@@ -68,6 +68,7 @@
 
 #define PRTE_SLURM_DYN_MAX_SIZE 256
 #define PRTE_SLURM_JOB_INFO_MAX_SIZE (1 * 1024 * 1024)
+#define PRTE_SLURM_JOB_ID_MAX_SIZE 20
 #define MAX_SBATCH_ARGS 32
 
 /*
@@ -99,9 +100,13 @@ static int prte_ras_slurm_wipe_dyn_hashtable(pmix_hash_table_t *table);
 static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table);
 static int prte_ras_slurm_make_job_field(pmix_hash_table_t *fields, const char *field_name, const char *field_format, char **field_out, bool obj_num);
 static int prte_ras_slurm_launch_expander_job(pmix_hash_table_t *fields);
+static int prte_ras_slurm_exec_sbatch(char * const *argv, char job_id[PRTE_SLURM_JOB_ID_MAX_SIZE]);
+static int prte_ras_slurm_get_full_jobinfo(const char *slurm_jobid, char **job_info_out);
+static int prte_ras_slurm_add_modified_resources(const char *slurm_jobid);
 #ifdef HAVE_JANSSON
 static int prte_ras_slurm_get_json_numobj_field(json_t *job, const char *key, pmix_hash_table_t *values_table);
 static int prte_ras_slurm_extract_job_fields_jansson(pmix_hash_table_t *values_table);
+static int prte_ras_slurm_add_modified_resources_jansson(const char *slurm_jobid);
 #endif
 
 /* Slurm sbatch parameters formats */
@@ -170,18 +175,20 @@ static const char *const num_obj_subfields[NUM_OBJ_SUBFIELD_COUNT] = {
     [NUM_OBJ_SUBFIELD_NUMBER]   = "number",
 };
 
-enum slurm_prte_request_fields {
-    PRTE_REQUEST_NODES,
-    PRTE_REQUEST_COUNT
+/* Fields PRRTE records or retrieves from Slurm */
+
+enum record_job_data_field {
+    PRTE_JOB_DATA_NODES,
+    PRTE_JOB_DATA_JOB_ID,
+    PRTE_JOB_DATA_COUNT
 };
 
-/* Fields to set in own request to Slurm */
-
-static const char *const prte_request_fields[PRTE_REQUEST_COUNT] = {
-    [PRTE_REQUEST_NODES]      = "nodes",
+static const char *const record_job_data_fields[PRTE_JOB_DATA_COUNT] = {
+    [PRTE_JOB_DATA_NODES]      = "nodes",
+    [PRTE_JOB_DATA_JOB_ID]      = "job_id",
 };
 
-static const size_t total_fields_len = STR_FIELD_COUNT + NUM_OBJ_FIELD_COUNT + PRTE_REQUEST_COUNT;
+static const size_t total_fields_len = STR_FIELD_COUNT + NUM_OBJ_FIELD_COUNT + PRTE_JOB_DATA_COUNT;
 
 static bool check_taint(char *name, char *evar)
 {
@@ -324,7 +331,7 @@ static void deallocate(prte_job_t *jdata, prte_app_context_t *app)
 
 static void modify(prte_pmix_server_req_t *req)
 {
-    int prte_err = PRTE_SUCCESS;
+    int err = PRTE_SUCCESS;
     int pmix_err = PMIX_SUCCESS;
 
     pmix_hash_table_t slurm_jobfields;
@@ -339,12 +346,14 @@ static void modify(prte_pmix_server_req_t *req)
         pmix_err = pmix_hash_table_init(&slurm_jobfields, total_fields_len);
 
         if(PMIX_SUCCESS != pmix_err) {
+            err = prte_pmix_convert_rc(pmix_err);
+            PRTE_ERROR_LOG(err);
             goto cleanup;
         }
 
-        prte_err = prte_ras_slurm_extract_job_fields(&slurm_jobfields);
+        err = prte_ras_slurm_extract_job_fields(&slurm_jobfields);
 
-        if(PRTE_SUCCESS != prte_err) {
+        if(PRTE_SUCCESS != err) {
             goto cleanup;
         }
 
@@ -356,7 +365,7 @@ static void modify(prte_pmix_server_req_t *req)
             if (0 == strcmp(req->info[i].key, PMIX_NUM_NODES)) {
 
                 if (req->info[i].value.type != PMIX_UINT32) {
-                    prte_err = PRTE_ERR_BAD_PARAM;
+                    err = PRTE_ERR_BAD_PARAM;
                     goto cleanup;
                 }
             }
@@ -371,42 +380,53 @@ static void modify(prte_pmix_server_req_t *req)
                     "%s ras:slurm:modify: modify request invalid",
                     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
 
-            prte_err = PRTE_ERR_NOT_FOUND;
+            err = PRTE_ERR_NOT_FOUND;
             goto cleanup;
         }
 
         int rc = asprintf(&nodes_string, "%" PRIu32, num_nodes);
         
         if(0 > rc) {
-            prte_err = PRTE_ERR_OUT_OF_RESOURCE;
+            err = PRTE_ERR_OUT_OF_RESOURCE;
+            PRTE_ERROR_LOG(err);
             goto cleanup;
         }
 
-        pmix_err = pmix_hash_table_set_value_ptr(&slurm_jobfields, prte_request_fields[PRTE_REQUEST_NODES],
-                                strlen(prte_request_fields[PRTE_REQUEST_NODES]), (void*)nodes_string);
+        pmix_err = pmix_hash_table_set_value_ptr(&slurm_jobfields, record_job_data_fields[PRTE_JOB_DATA_NODES],
+                                strlen(record_job_data_fields[PRTE_JOB_DATA_NODES]), (void*)nodes_string);
 
         if(PMIX_SUCCESS != pmix_err) {
+            err = prte_pmix_convert_rc(pmix_err);
+            PRTE_ERROR_LOG(err);
             goto cleanup;
         }
 
-        prte_err = prte_ras_slurm_launch_expander_job(&slurm_jobfields);
+        err = prte_ras_slurm_launch_expander_job(&slurm_jobfields);
 
-        if(PRTE_SUCCESS == prte_err) {
-            printf("Yippie, launched an expander job!\n");
+        if(PRTE_SUCCESS != err) {
+            goto cleanup;
         }
+
+        char *job_id;
+        pmix_err = pmix_hash_table_get_value_ptr(&slurm_jobfields, record_job_data_fields[PRTE_JOB_DATA_JOB_ID],
+                        strlen(record_job_data_fields[PRTE_JOB_DATA_JOB_ID]), (void**)&job_id);
+
+        if(PMIX_SUCCESS != pmix_err) {
+            err = prte_pmix_convert_rc(pmix_err);
+            PRTE_ERROR_LOG(err);
+            goto cleanup;
+        }
+
+        PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
+        "%s ras:slurm:modify: got job ID for new resources %s",
+        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), job_id));
+
+        prte_ras_slurm_add_modified_resources(job_id);
     }
 
     cleanup:
 
     free(nodes_string);
-
-    if(PMIX_SUCCESS != pmix_err) {
-        prte_err = prte_pmix_convert_rc(pmix_err);
-    }
-
-    if(prte_err != PRTE_SUCCESS) {
-        PRTE_ERROR_LOG(prte_err);
-    }
 
     if(have_slurm_jobfields) {
         prte_ras_slurm_wipe_dyn_hashtable(&slurm_jobfields);
@@ -414,7 +434,8 @@ static void modify(prte_pmix_server_req_t *req)
         PMIX_DESTRUCT(&slurm_jobfields);
     }
 
-    req->status = PMIX_ERR_NOT_SUPPORTED;
+    req->status = err;
+
     return;
 }
 
@@ -829,7 +850,7 @@ static int prte_ras_slurm_wipe_dyn_hashtable(pmix_hash_table_t *table) {
     void *prev_node;
     void *node;
 
-    int pmix_err;
+    int pmix_err = PMIX_SUCCESS;
 
     pmix_err = pmix_hash_table_get_first_key_ptr(table, &key, &key_size, &val, &node);
 
@@ -854,12 +875,23 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table) {
 #ifndef HAVE_JANSSON
         pmix_output(0,
                     "ras:slurm:extract_job_fields: feature requires the Jansson "
-                    "library to be available in compilation.\n",
-                    tmp);
+                    "library to be available in compilation.\n");
     return PRTE_ERR_NOT_SUPPORTED;
 #else
     return prte_ras_slurm_extract_job_fields_jansson(values_table);
 #endif
+}
+
+static int prte_ras_slurm_add_modified_resources(const char *slurm_jobid) {
+#ifndef HAVE_JANSSON
+        pmix_output(0,
+                    "ras:slurm:add_modified_resources: feature requires the Jansson "
+                    "library to be available in compilation.\n");
+    return PRTE_ERR_NOT_SUPPORTED;
+#else
+    return prte_ras_slurm_add_modified_resources_jansson(slurm_jobid);
+#endif
+
 }
 
 #ifdef HAVE_JANSSON
@@ -897,92 +929,20 @@ static int prte_ras_slurm_extract_job_fields_jansson(pmix_hash_table_t *values_t
         }
     }
 
-    /* TODO: how about Slurm-side errors */
+    err = prte_ras_slurm_get_full_jobinfo(slurm_jobid, &slurm_json);
 
-    char *cmd_format = "scontrol show job %s --json";
-
-    if(0 > asprintf(&cmd, cmd_format, slurm_jobid)) {
-        cmd = NULL;
-        err = PRTE_ERR_OUT_OF_RESOURCE;
-        PRTE_ERROR_LOG(err);
+    if(PRTE_SUCCESS != err) {
         goto cleanup;
     }
 
-    fp = popen(cmd, "r");
-
-    if(!fp) {
-        err = PRTE_ERR_FILE_OPEN_FAILURE;
-        PRTE_ERROR_LOG(err);
-        goto cleanup;
-    }
-
-    size_t curr_limit = 4096;
-    size_t len = 0;
-
-    slurm_json = malloc(curr_limit);
-
-    if (!slurm_json) {
-        err = PRTE_ERR_OUT_OF_RESOURCE;
-        PRTE_ERROR_LOG(err);
-        goto cleanup;
-    }
-
-    char buf[1024];
-    while (fgets(buf, sizeof(buf), fp)) {
-        size_t chunk_len = strlen(buf);
-
-        if (len + chunk_len + 1 > curr_limit) {
-            curr_limit *= 2;
-
-            if(curr_limit > PRTE_SLURM_JOB_INFO_MAX_SIZE) {
-                err = PRTE_ERR_MEM_LIMIT_EXCEEDED;
-                PRTE_ERROR_LOG(err);
-                goto cleanup;
-            }
-
-            char *tmp = realloc(slurm_json, curr_limit);
-            if (!tmp) {
-                err = PRTE_ERR_OUT_OF_RESOURCE;
-                PRTE_ERROR_LOG(err);
-                goto cleanup;
-            }
-
-            slurm_json = tmp;
-        }
-
-        memcpy(slurm_json + len, buf, chunk_len);
-        len += chunk_len;
-    }
-
-    slurm_json[len] = '\0';
-
-    int status = pclose(fp);
-    fp = NULL;
-
-    if(0 != status) {
-        PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
-        "%s ras:slurm:extract_job_fields: non-zero exit code "
-        " (%d) from scontrol command.",
-        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), status));
-        err = PRTE_ERR_NOT_FOUND;
-        PRTE_ERROR_LOG(err);
-        goto cleanup;
-    }
-
-    if(0 == strlen(slurm_json)) {
-        err = PRTE_ERR_NOT_FOUND;
-        PRTE_ERROR_LOG(err);
-        goto cleanup;
-    }
-
-    root = json_loads(slurm_json, 0, &json_err);
+    root = json_loads(slurm_json, JSON_REJECT_DUPLICATES, &json_err);
 
     if (!root) {
 
         PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
             "%s ras:slurm:extract_job_fields: output from scontrol was "
             "not parsable as JSON: \"%s\"",
-            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), slurm_json));
+            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), json_err.text));
 
         err = PRTE_ERR_JSON_PARSE_FAILURE;
         PRTE_ERROR_LOG(err);
@@ -1082,6 +1042,7 @@ static int prte_ras_slurm_extract_job_fields_jansson(pmix_hash_table_t *values_t
     return err;
 }
 
+
 static int prte_ras_slurm_get_json_numobj_field(json_t *job, const char *key, pmix_hash_table_t *values_table) {
     int prte_err = PRTE_SUCCESS;
     int pmix_err = PMIX_SUCCESS;
@@ -1151,6 +1112,172 @@ static int prte_ras_slurm_get_json_numobj_field(json_t *job, const char *key, pm
     return PRTE_SUCCESS;
 }
 
+static int prte_ras_slurm_add_modified_resources_jansson(const char *slurm_jobid) {
+
+    char *slurm_json = NULL;
+
+    json_error_t json_err;
+    json_t *root;
+    bool root_json_owned = false;
+
+    int err = PRTE_SUCCESS;
+
+    pmix_list_t new_nodes;
+    PMIX_CONSTRUCT(&new_nodes, pmix_list_t);
+
+    err = prte_ras_slurm_get_full_jobinfo(slurm_jobid, &slurm_json);
+
+    if(PRTE_SUCCESS != err) {
+        goto cleanup;
+    }
+
+    root = json_loads(slurm_json, JSON_REJECT_DUPLICATES, &json_err);
+
+    if (!root) {
+
+        PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
+            "%s ras:slurm:add_modified_resources: output from scontrol was "
+            "not parsable as JSON: \"%s\"",
+            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), json_err.text));
+
+        err = PRTE_ERR_JSON_PARSE_FAILURE;
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
+    }
+
+    root_json_owned = true;
+
+    json_t *job_resources = json_object_get(root, "job_resources");
+
+    if(!job_resources || !json_is_object(job_resources)) {
+        err = PRTE_ERR_JSON_PARSE_FAILURE;
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
+    }
+
+    json_t *allocated_nodes = json_object_get(job_resources, "allocated_nodes");
+
+    if(!allocated_nodes || !json_is_array(allocated_nodes)) {
+        err = PRTE_ERR_JSON_PARSE_FAILURE;
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
+    }
+
+    size_t idx;
+    json_t *node_obj;
+
+    json_array_foreach(allocated_nodes, idx, node_obj) {
+        if (!json_is_object(node_obj)) {
+            err = PRTE_ERR_JSON_PARSE_FAILURE;
+            PRTE_ERROR_LOG(err);
+            goto cleanup;
+        }
+
+        int slot_count = 0;
+
+        json_t *sockets = json_object_get(node_obj, "sockets");
+
+        if(!sockets || !json_is_object(sockets)) {
+            err = PRTE_ERR_JSON_PARSE_FAILURE;
+            PRTE_ERROR_LOG(err);
+            goto cleanup; 
+        }
+
+        const char *socket_key;
+        json_t *socket_obj;
+
+        json_object_foreach(sockets, socket_key, socket_obj) {
+
+            if (!json_is_object(socket_obj)) {
+                err = PRTE_ERR_JSON_PARSE_FAILURE;
+                PRTE_ERROR_LOG(err);
+                goto cleanup;
+            }
+
+            json_t *cores = json_object_get(socket_obj, "cores");
+
+            if (!cores || !json_is_object(cores)) {
+                err = PRTE_ERR_JSON_PARSE_FAILURE;
+                PRTE_ERROR_LOG(err);
+                goto cleanup;
+            }
+
+            const char *core_key;
+            json_t *core_val;
+
+            json_object_foreach(cores, core_key, core_val) {
+
+                if(!json_is_string(core_val)) {
+                    err = PRTE_ERR_JSON_PARSE_FAILURE;
+                    PRTE_ERROR_LOG(err);
+                    goto cleanup;
+                }
+
+                if (0 == strcmp(json_string_value(core_val), "allocated")) {
+                    slot_count++;
+                }
+            }
+        }
+
+        json_t *nodename = json_object_get(node_obj, "nodename");
+
+        if (!nodename || !json_is_string(nodename)) {
+            err = PRTE_ERR_JSON_PARSE_FAILURE;
+            PRTE_ERROR_LOG(err);
+            goto cleanup;
+        }
+
+        const char *nodename_string = json_string_value(nodename);
+
+        if (NULL == nodename_string || '\0' == nodename_string[0]) {
+            err = PRTE_ERR_BAD_PARAM;
+            PRTE_ERROR_LOG(err);
+            goto cleanup;
+        }
+
+        char *nodename_dyn = strdup(nodename_string);
+
+        if (NULL == nodename_dyn) {
+            err = PRTE_ERR_OUT_OF_RESOURCE;
+            PRTE_ERROR_LOG(err);
+            goto cleanup;  
+        }
+
+        prte_node_t *node = PMIX_NEW(prte_node_t);
+        
+        node->name = nodename_dyn;
+        node->slots = slot_count;
+        node->state = PRTE_NODE_STATE_UP;
+
+        pmix_list_append(&new_nodes, &node->super);
+
+        PMIX_OUTPUT_VERBOSE((20, prte_ras_base_framework.framework_output,
+        "%s ras:slurm:add_modified_resources: discovered node %s with "
+        " %d slots",
+        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), node)); 
+    }
+
+    err = prte_ras_base_node_insert(&new_nodes, NULL);
+
+    if(PRTE_SUCCESS != err) {
+        PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
+        "%s ras:slurm:add_modified_resources: error inserting new "
+        "nodes into global list.",
+        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME))); 
+        goto cleanup;
+    }
+
+    cleanup:
+
+    PMIX_DESTRUCT(&new_nodes);
+
+    free(slurm_json);
+
+    if(root_json_owned) {
+        json_decref(root);
+    }
+}
+
 #endif
 
 static int prte_ras_slurm_make_job_field(pmix_hash_table_t *fields, const char *field_name, const char *field_format, char **field_out, bool obj_num) {
@@ -1192,32 +1319,27 @@ static int prte_ras_slurm_launch_expander_job(pmix_hash_table_t *fields) {
     int pmix_err = PMIX_SUCCESS;
 
     char *argv[MAX_SBATCH_ARGS] = {NULL};
-    
     int argc = 0;
-
-    argv[argc] = strdup("sbatch");
-
-    if(NULL == argv[argc]) {
-        err = PRTE_ERR_OUT_OF_RESOURCE;
-        PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
-        goto cleanup;
-    }
-
-    argc++;
-
-    argv[argc] = strdup("--wrap=sleep infinity");
-
-    if(NULL == argv[argc]) {
-        err = PRTE_ERR_OUT_OF_RESOURCE;
-        PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
-        goto cleanup;
-    }
-
-    argc++;
 
     bool have_mem_per_cpu = false;
 
     FILE *fp = NULL;
+
+    const char * const initial_args[] = {"sbatch",
+                                "--wrap=sleep infinity", 
+                                "--wait"
+                                "--parsable",
+                                NULL };
+
+    for(int i = 0; initial_args[i] != NULL; i++) {
+        argv[argc] = strdup(initial_args[i]);
+        if(NULL == argv[argc]) {
+            err = PRTE_ERR_OUT_OF_RESOURCE;
+            PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
+            goto cleanup;
+        }
+        argc++;
+    }
     
     if (prte_mca_ras_slurm_component.propagate_account) {
         err = prte_ras_slurm_make_job_field(fields, str_fields[STR_ACCOUNT], account_format, &argv[argc], false);
@@ -1270,7 +1392,7 @@ static int prte_ras_slurm_launch_expander_job(pmix_hash_table_t *fields) {
         }
     }
 
-    err = prte_ras_slurm_make_job_field(fields, prte_request_fields[PRTE_REQUEST_NODES], nodes_format, &argv[argc], false);
+    err = prte_ras_slurm_make_job_field(fields, record_job_data_fields[PRTE_JOB_DATA_NODES], nodes_format, &argv[argc], false);
 
     if(PRTE_SUCCESS == err) {
         argc++;
@@ -1324,23 +1446,32 @@ static int prte_ras_slurm_launch_expander_job(pmix_hash_table_t *fields) {
         goto cleanup;
     }
 
-    pid_t pid = fork();
+    char job_id[PRTE_SLURM_JOB_ID_MAX_SIZE] = {0};
+    err = prte_ras_slurm_exec_sbatch(argv, job_id);
 
-    if(pid < 0) {
-        err = PRTE_ERR_IN_ERRNO;
-        PRTE_ERROR_LOG(err);
-        char *strerr = strerror(errno);
-        PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
-                        "%s ras:slurm:launch_expander_job: fork failed: %s",
-                        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), strerr));
+    if(PRTE_SUCCESS != err) {
         goto cleanup;
     }
 
-    /* Just try to submit as batch job for now; check back on results later */
-    if (pid == 0) {
-        if (-1 == execvp(argv[0], argv)) {
-            _exit(127);
-        }
+    PMIX_OUTPUT_VERBOSE((10, prte_ras_base_framework.framework_output,
+                "%s ras:slurm:launch_expander_job: submitted job ID %s",
+                PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), job_id));
+
+    char *job_id_dyn = strdup(job_id);
+
+    if(NULL == job_id_dyn) {
+        err = PRTE_ERR_OUT_OF_RESOURCE;
+        PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
+        goto cleanup;
+    }
+
+    pmix_err = pmix_hash_table_set_value_ptr(fields, record_job_data_fields[PRTE_JOB_DATA_JOB_ID],
+                        strlen(record_job_data_fields[PRTE_JOB_DATA_JOB_ID]), (void*)job_id_dyn);
+
+    if(PMIX_SUCCESS != pmix_err) {
+        err = prte_pmix_convert_rc(pmix_err);
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
     }
 
     cleanup:
@@ -1353,9 +1484,280 @@ static int prte_ras_slurm_launch_expander_job(pmix_hash_table_t *fields) {
         free(argv[i]);
     }
 
-    if(PRTE_SUCCESS != err) {
+    return err;
+}
+
+static int prte_ras_slurm_exec_sbatch(char * const *argv, char job_id[PRTE_SLURM_JOB_ID_MAX_SIZE]) {
+    
+    int err = PRTE_SUCCESS;
+
+    int pipefd[2] = {-1, -1};
+    int pipe_err = pipe(pipefd);
+
+    if(pipe_err < 0) {
+        err = PRTE_ERR_IN_ERRNO;
         PRTE_ERROR_LOG(err);
+        char *strerr = strerror(errno);
+        PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
+                        "%s ras:slurm:exec_sbatch: pipe failed: %s",
+                        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), strerr));
+        goto cleanup;   
+    }
+
+    pid_t pid = fork();
+
+    if(pid < 0) {
+        err = PRTE_ERR_IN_ERRNO;
+        PRTE_ERROR_LOG(err);
+        char *strerr = strerror(errno);
+        PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
+                        "%s ras:slurm:exec_sbatch: fork failed: %s",
+                        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), strerr));
+        goto cleanup;
+    }
+
+    if (pid == 0) {
+
+        /* Child writes; close read end */
+        close(pipefd[0]);
+        pipefd[0] = -1;
+
+        /* Redirect output to the pipe */
+        if (dup2(pipefd[1], STDOUT_FILENO) < 0) {
+            _exit(127);
+        }
+
+        /* No longer needed */
+        close(pipefd[1]);
+        pipefd[1] = -1;
+
+        execvp(argv[0], argv);
+        
+        /* Something went wrong if we reached this point */
+        _exit(127);
+    }
+
+    /* Parent reads; close write end */
+    close(pipefd[1]);
+    pipefd[1] = -1;
+
+    size_t n = 0;
+
+    bool overflow = false;
+
+    bool pipe_draining = false;
+    bool pipe_drained = false;
+
+    /* Try to get job ID from pipe and drain it after */
+    while(!pipe_drained) {
+        char c;
+        ssize_t r = read(pipefd[0], &c, 1);
+
+        if(1 == r && !pipe_draining)
+        {
+            /* Slurm job ID, exclusively from digits 0-9 */
+            if((n + 1 < PRTE_SLURM_JOB_ID_MAX_SIZE) 
+                && ('0' <= c && c <= '9')) {
+                job_id[n++] = c;
+            }
+
+            /* Saw more digits, but had no space for them */
+            else if('0' <= c && c <= '9') {
+                overflow = true;
+                pipe_draining = true;
+            }
+
+            /* Ignore initial whitespace */
+            else if(!(0 == n && isspace((unsigned char)c))) {
+                pipe_draining = true;
+            }
+        }
+        
+        /* Nothing more to read */
+        else if(0 == r) {
+            pipe_drained = true;
+        }
+
+        /* Tolerate interruptions */
+        else if (r < 0 && errno == EINTR) {
+            continue;
+        } 
+
+        /* Something went wrong */
+        else {
+            err = PRTE_ERR_IN_ERRNO;
+            PRTE_ERROR_LOG(err);
+            char *strerr = strerror(errno);
+            PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
+            "%s ras:slurm:exec_sbatch: pipe read failed: %s",
+            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), strerr));
+            goto cleanup;
+        }
+    }
+
+    job_id[n] = '\0';
+    close(pipefd[0]);
+    pipefd[0] = -1;
+
+    int status;
+
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR) {
+            continue; 
+        }
+        
+        err = PRTE_ERR_IN_ERRNO;
+        PRTE_ERROR_LOG(err);
+        char *strerr = strerror(errno);
+        PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
+        "%s ras:slurm:exec_sbatch: waitpid failed: %s",
+        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), strerr));
+        goto cleanup;
+    }
+
+    if (!WIFEXITED(status) || 0 != WEXITSTATUS(status)) {
+        PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
+        "%s ras:slurm:exec_sbatch: sbatch failed or exited non-zero",
+        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
+        err = PRTE_ERR_SLURM_SUBMIT_FAILURE;
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
+    }
+
+    if(n == 0 || overflow) {
+        PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
+        "%s ras:slurm:exec_sbatch: sbatch exited normally, but got unexpected/truncated output",
+        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
+        err = PRTE_ERR_SLURM_SUBMIT_FAILURE;
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
+    }
+
+    cleanup:
+
+    if(pipefd[0] >= 0) {
+        close(pipefd[0]);
+    }
+
+    if(pipefd[1] >= 0) {
+        close(pipefd[1]);
     }
 
     return err;
+}
+
+static int prte_ras_slurm_get_full_jobinfo(const char *slurm_jobid, char **job_info_out) {
+
+    if(!job_info_out) {
+        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    static const char *cmd_format = "scontrol show job %s --json";
+    
+    int err = PRTE_SUCCESS;
+    FILE *fp = NULL;
+
+    char *cmd = NULL;
+
+    size_t curr_limit = 4096;
+    size_t len = 0;
+
+    if(0 > asprintf(&cmd, cmd_format, slurm_jobid)) {
+        cmd = NULL;
+        err = PRTE_ERR_OUT_OF_RESOURCE;
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
+    }
+
+    fp = popen(cmd, "r");
+
+    if(!fp) {
+        err = PRTE_ERR_FILE_OPEN_FAILURE;
+        goto cleanup;
+    }
+
+    *job_info_out = malloc(curr_limit);
+
+    if (!(*job_info_out)) {
+        err = PRTE_ERR_OUT_OF_RESOURCE;
+        goto cleanup;
+    }
+
+    char buf[1024];
+    while (fgets(buf, sizeof(buf), fp)) {
+
+        size_t chunk_len = strlen(buf);
+
+        /* verify the chunk can fit within limits */
+        if (chunk_len > PRTE_SLURM_JOB_INFO_MAX_SIZE - len - 1) {
+            err = PRTE_ERR_MEM_LIMIT_EXCEEDED;
+            goto cleanup;
+        }
+
+        size_t needed = len + chunk_len + 1;
+
+        if(curr_limit < needed) {
+
+            size_t new_limit = curr_limit;
+
+            while (needed > new_limit) {
+                if (new_limit > PRTE_SLURM_JOB_INFO_MAX_SIZE / 2) {
+                    new_limit = PRTE_SLURM_JOB_INFO_MAX_SIZE;
+                    break;
+                } else {
+                    new_limit *= 2;
+                }
+            }
+
+            char *job_info_realloc = realloc((*job_info_out), sizeof(char) * new_limit);
+            
+            if(NULL == job_info_realloc) {
+                err = PRTE_ERR_OUT_OF_RESOURCE;
+                goto cleanup;
+            }
+
+            curr_limit = new_limit;
+            (*job_info_out) = job_info_realloc;
+        }
+
+        memcpy((*job_info_out) + len, buf, chunk_len);
+        len += chunk_len;
+    }
+
+    (*job_info_out)[len] = '\0';
+
+    int status = pclose(fp);
+    fp = NULL;
+
+    if(0 != status) {
+        PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
+        "%s ras:slurm:get_full_job_info: non-zero exit code "
+        " (%d) from scontrol command.",
+        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), status));
+        err = PRTE_ERR_NOT_FOUND;
+        goto cleanup;
+    }
+
+    if(0 == strlen((*job_info_out))) {
+        PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
+        "%s ras:slurm:get_full_job_info: got empty output "
+        "from scontrol command.",
+        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
+        err = PRTE_ERR_NOT_FOUND;
+        goto cleanup;
+    }
+
+    cleanup:
+
+    if(NULL != fp) {
+        pclose(fp);
+    }
+
+    if(PRTE_SUCCESS != err) {
+        free(*job_info_out);
+        *job_info_out = NULL;
+    }
+
+    free(cmd);
 }
