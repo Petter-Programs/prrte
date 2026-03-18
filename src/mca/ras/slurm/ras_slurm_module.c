@@ -68,7 +68,7 @@
 
 #define PRTE_SLURM_DYN_MAX_SIZE 256
 #define PRTE_SLURM_JOB_INFO_MAX_SIZE (1 * 1024 * 1024)
-#define PRTE_SLURM_JOB_ID_MAX_SIZE 20
+#define PRTE_SLURM_JOB_ID_MAX_LEN 20
 #define MAX_SBATCH_ARGS 32
 
 /*
@@ -100,13 +100,15 @@ static int prte_ras_slurm_wipe_dyn_hashtable(pmix_hash_table_t *table);
 static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table);
 static int prte_ras_slurm_make_job_field(pmix_hash_table_t *fields, const char *field_name, const char *field_format, char **field_out, bool obj_num);
 static int prte_ras_slurm_launch_expander_job(pmix_hash_table_t *fields);
-static int prte_ras_slurm_exec_sbatch(char * const *argv, char job_id[PRTE_SLURM_JOB_ID_MAX_SIZE]);
-static int prte_ras_slurm_get_full_jobinfo(const char *slurm_jobid, char **job_info_out);
+static int prte_ras_slurm_exec_sbatch(char * const *argv, char job_id[PRTE_SLURM_JOB_ID_MAX_LEN]);
 static int prte_ras_slurm_add_modified_resources(const char *slurm_jobid);
+static int prte_ras_slurm_wait_resources(const char *slurm_jobid);
 #ifdef HAVE_JANSSON
 static int prte_ras_slurm_get_json_numobj_field(json_t *job, const char *key, pmix_hash_table_t *values_table);
 static int prte_ras_slurm_extract_job_fields_jansson(pmix_hash_table_t *values_table);
 static int prte_ras_slurm_add_modified_resources_jansson(const char *slurm_jobid);
+static int prte_ras_slurm_wait_resources_jansson(const char *slurm_jobid);
+static int prte_ras_slurm_get_jobinfo_jansson(const char *slurm_jobid, json_t **job_info_out);
 #endif
 
 /* Slurm sbatch parameters formats */
@@ -119,13 +121,14 @@ static const char *mem_per_node_format = "--mem=%ld";
 static const char *time_format = "--time=%s";
 static const char *nodes_format = "--nodes=%s";
 
-/* Markers for expected types when parsing Slurm JSON */
-typedef enum {
-    SLURM_JSON_STRING = 1, /* text-based entry */
-    SLURM_JSON_UINT,       /* entry only with digits 0 to 9 */
-    SLURM_JSON_BOOL,       /* entry that is true or false */
-    SLURM_JSON_OBJ,        /* JSON object */
-} slurm_json_expect_t;
+#ifdef HAVE_JANSSON
+/* Bounded reader for Slurm JSON output */
+typedef struct {
+    FILE *fp;
+    size_t remaining;
+    bool truncated;
+} jansson_limited_reader_t;
+#endif
 
 static char const * const unset_num_marker = "none";  /* Marker for numbers with set: false */
 static char const * const infinite_num_marker = "inf"; /* Marker for numbers with set: true and infinite: true */
@@ -421,7 +424,17 @@ static void modify(prte_pmix_server_req_t *req)
         "%s ras:slurm:modify: got job ID for new resources %s",
         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), job_id));
 
-        prte_ras_slurm_add_modified_resources(job_id);
+        err = prte_ras_slurm_wait_resources(job_id);
+        
+        if(PRTE_SUCCESS != err) {
+            goto cleanup;
+        }
+
+        err = prte_ras_slurm_add_modified_resources(job_id);
+
+        if(PRTE_SUCCESS != err) {
+            goto cleanup;
+        }
     }
 
     cleanup:
@@ -818,7 +831,7 @@ static int prte_ras_slurm_token_has_control_chars(const char *s, size_t len, boo
 
     *has_control_chars = false;
 
-    for (size_t i = 0; i < len; ++i) {
+    for (size_t i = 0; i < len; i++) {
         unsigned char c = (unsigned char)s[i];
 
         /* check if control character */
@@ -872,26 +885,36 @@ static int prte_ras_slurm_wipe_dyn_hashtable(pmix_hash_table_t *table) {
 }
 
 static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table) {
-#ifndef HAVE_JANSSON
+#ifdef HAVE_JANSSON
+    return prte_ras_slurm_extract_job_fields_jansson(values_table);
+#else
         pmix_output(0,
                     "ras:slurm:extract_job_fields: feature requires the Jansson "
                     "library to be available in compilation.\n");
     return PRTE_ERR_NOT_SUPPORTED;
-#else
-    return prte_ras_slurm_extract_job_fields_jansson(values_table);
 #endif
 }
 
 static int prte_ras_slurm_add_modified_resources(const char *slurm_jobid) {
-#ifndef HAVE_JANSSON
-        pmix_output(0,
+#ifdef HAVE_JANSSON
+    return prte_ras_slurm_add_modified_resources_jansson(slurm_jobid);
+#else
+    pmix_output(0,
                     "ras:slurm:add_modified_resources: feature requires the Jansson "
                     "library to be available in compilation.\n");
     return PRTE_ERR_NOT_SUPPORTED;
-#else
-    return prte_ras_slurm_add_modified_resources_jansson(slurm_jobid);
 #endif
+}
 
+static int prte_ras_slurm_wait_resources(const char *slurm_jobid) {
+#ifdef HAVE_JANSSON
+    return prte_ras_slurm_wait_resources_jansson(slurm_jobid);
+#else
+    pmix_output(0,
+                    "ras:slurm:wait_resources: feature requires the Jansson "
+                    "library to be available in compilation.\n");
+    return PRTE_ERR_NOT_SUPPORTED;
+#endif
 }
 
 #ifdef HAVE_JANSSON
@@ -905,8 +928,7 @@ static int prte_ras_slurm_extract_job_fields_jansson(pmix_hash_table_t *values_t
     char *cmd = NULL;
 
     json_error_t json_err;
-    json_t *root;
-    bool root_json_owned = false;
+    json_t *job = NULL;
 
     char *slurm_jobid;
     if (NULL == (slurm_jobid = getenv("SLURM_JOBID"))) {
@@ -914,57 +936,11 @@ static int prte_ras_slurm_extract_job_fields_jansson(pmix_hash_table_t *values_t
         return PRTE_ERR_NOT_FOUND;
     }
 
-    /* Make sure the job ID read is something reasonable */
-    
-    size_t id_len = strlen(slurm_jobid);
-    if (id_len == 0 || id_len > 20) {
-        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
-        return PRTE_ERR_BAD_PARAM;
-    }
-
-    for (const char *p = slurm_jobid; *p != '\0'; ++p) {
-        if (!isdigit((unsigned char)*p)) {
-            PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
-            return PRTE_ERR_BAD_PARAM;
-        }
-    }
-
-    err = prte_ras_slurm_get_full_jobinfo(slurm_jobid, &slurm_json);
+    /* Read JSON from stream and extract the first and only job 
+       in the "jobs" array */
+    err = prte_ras_slurm_get_jobinfo_jansson(slurm_jobid, &job);
 
     if(PRTE_SUCCESS != err) {
-        goto cleanup;
-    }
-
-    root = json_loads(slurm_json, JSON_REJECT_DUPLICATES, &json_err);
-
-    if (!root) {
-
-        PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
-            "%s ras:slurm:extract_job_fields: output from scontrol was "
-            "not parsable as JSON: \"%s\"",
-            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), json_err.text));
-
-        err = PRTE_ERR_JSON_PARSE_FAILURE;
-        PRTE_ERROR_LOG(err);
-        goto cleanup;
-    }
-
-    root_json_owned = true;
-
-    /* First, extract the object inside the "jobs" field of the Slurm JSON.
-     * we expect and require exactly one job in the result  */
-    json_t *jobs = json_object_get(root, jobs_field);
-    if (NULL == jobs || !json_is_array(jobs) || 1 != json_array_size(jobs)) {
-        err = PRTE_ERR_JSON_PARSE_FAILURE;
-        PRTE_ERROR_LOG(err);
-        goto cleanup;
-    }
-
-    json_t *job = json_array_get(jobs, 0);
-
-    if (NULL == job || !json_is_object(job)) {
-        err = PRTE_ERR_JSON_PARSE_FAILURE;
-        PRTE_ERROR_LOG(err);
         goto cleanup;
     }
 
@@ -1032,8 +1008,8 @@ static int prte_ras_slurm_extract_job_fields_jansson(pmix_hash_table_t *values_t
         pclose(fp);
     }
 
-    if(root_json_owned) {
-        json_decref(root);
+    if(NULL != job) {
+        json_decref(job);
     }
 
     free(slurm_json);
@@ -1114,61 +1090,66 @@ static int prte_ras_slurm_get_json_numobj_field(json_t *job, const char *key, pm
 
 static int prte_ras_slurm_add_modified_resources_jansson(const char *slurm_jobid) {
 
-    char *slurm_json = NULL;
-
-    json_error_t json_err;
-    json_t *root;
-    bool root_json_owned = false;
+    json_t *root = NULL;
 
     int err = PRTE_SUCCESS;
 
     pmix_list_t new_nodes;
     PMIX_CONSTRUCT(&new_nodes, pmix_list_t);
 
-    err = prte_ras_slurm_get_full_jobinfo(slurm_jobid, &slurm_json);
+    err = prte_ras_slurm_get_jobinfo_jansson(slurm_jobid, &root);
 
     if(PRTE_SUCCESS != err) {
         goto cleanup;
     }
 
-    root = json_loads(slurm_json, JSON_REJECT_DUPLICATES, &json_err);
-
-    if (!root) {
-
-        PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
-            "%s ras:slurm:add_modified_resources: output from scontrol was "
-            "not parsable as JSON: \"%s\"",
-            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), json_err.text));
-
-        err = PRTE_ERR_JSON_PARSE_FAILURE;
-        PRTE_ERROR_LOG(err);
-        goto cleanup;
-    }
-
-    root_json_owned = true;
-
     json_t *job_resources = json_object_get(root, "job_resources");
 
-    if(!job_resources || !json_is_object(job_resources)) {
+    if(NULL == job_resources || !json_is_object(job_resources)) {
         err = PRTE_ERR_JSON_PARSE_FAILURE;
         PRTE_ERROR_LOG(err);
         goto cleanup;
     }
 
-    json_t *allocated_nodes = json_object_get(job_resources, "allocated_nodes");
+    json_t *nodes = json_object_get(job_resources, "nodes");
 
-    if(!allocated_nodes || !json_is_array(allocated_nodes)) {
+    if(NULL == nodes || !json_is_object(nodes)) {
         err = PRTE_ERR_JSON_PARSE_FAILURE;
         PRTE_ERROR_LOG(err);
         goto cleanup;
     }
 
-    size_t idx;
+    json_t *allocation = json_object_get(nodes, "allocation");
+
+    if (NULL == allocation || !json_is_array(allocation)) {
+        err = PRTE_ERR_JSON_PARSE_FAILURE;
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
+    }
+
+    size_t node_idx;
     json_t *node_obj;
 
-    json_array_foreach(allocated_nodes, idx, node_obj) {
+    /* Retrieve node names and allocated slots */
+    json_array_foreach(allocation, node_idx, node_obj) {
         if (!json_is_object(node_obj)) {
             err = PRTE_ERR_JSON_PARSE_FAILURE;
+            PRTE_ERROR_LOG(err);
+            goto cleanup;
+        }
+
+        json_t *nodename = json_object_get(node_obj, "name");
+
+        if (NULL == nodename || !json_is_string(nodename)) {
+            err = PRTE_ERR_JSON_PARSE_FAILURE;
+            PRTE_ERROR_LOG(err);
+            goto cleanup;
+        }
+
+        const char *nodename_string = json_string_value(nodename);
+
+        if (NULL == nodename_string || '\0' == nodename_string[0]) {
+            err = PRTE_ERR_BAD_PARAM;
             PRTE_ERROR_LOG(err);
             goto cleanup;
         }
@@ -1177,16 +1158,16 @@ static int prte_ras_slurm_add_modified_resources_jansson(const char *slurm_jobid
 
         json_t *sockets = json_object_get(node_obj, "sockets");
 
-        if(!sockets || !json_is_object(sockets)) {
+        if(NULL == sockets || !json_is_array(sockets)) {
             err = PRTE_ERR_JSON_PARSE_FAILURE;
             PRTE_ERROR_LOG(err);
             goto cleanup; 
         }
 
-        const char *socket_key;
+        size_t socket_idx;
         json_t *socket_obj;
 
-        json_object_foreach(sockets, socket_key, socket_obj) {
+        json_array_foreach(sockets, socket_idx, socket_obj) {
 
             if (!json_is_object(socket_obj)) {
                 err = PRTE_ERR_JSON_PARSE_FAILURE;
@@ -1196,40 +1177,50 @@ static int prte_ras_slurm_add_modified_resources_jansson(const char *slurm_jobid
 
             json_t *cores = json_object_get(socket_obj, "cores");
 
-            if (!cores || !json_is_object(cores)) {
+            if (NULL == cores || !json_is_array(cores)) {
                 err = PRTE_ERR_JSON_PARSE_FAILURE;
                 PRTE_ERROR_LOG(err);
                 goto cleanup;
             }
 
-            const char *core_key;
-            json_t *core_val;
+            size_t core_idx;
+            json_t *core_obj;
 
-            json_object_foreach(cores, core_key, core_val) {
+            json_array_foreach(cores, core_idx, core_obj) {
 
-                if(!json_is_string(core_val)) {
+                if(!json_is_object(core_obj)) {
                     err = PRTE_ERR_JSON_PARSE_FAILURE;
                     PRTE_ERROR_LOG(err);
                     goto cleanup;
                 }
 
-                if (0 == strcmp(json_string_value(core_val), "allocated")) {
-                    slot_count++;
+                json_t *statuses = json_object_get(core_obj, "status");
+                if (NULL == statuses || !json_is_array(statuses)) {
+                    err = PRTE_ERR_JSON_PARSE_FAILURE;
+                    PRTE_ERROR_LOG(err);
+                    goto cleanup;
+                }
+
+                size_t status_idx;
+                json_t *status_obj;
+
+                json_array_foreach(statuses, status_idx, status_obj) {
+
+                    if(!json_is_string(status_obj)) {
+                        err = PRTE_ERR_JSON_PARSE_FAILURE;
+                        PRTE_ERROR_LOG(err);
+                        goto cleanup;
+                    }
+
+                    if (0 == strcmp(json_string_value(status_obj), "ALLOCATED")) {
+                        slot_count++;
+                        break;
+                    }
                 }
             }
         }
 
-        json_t *nodename = json_object_get(node_obj, "nodename");
-
-        if (!nodename || !json_is_string(nodename)) {
-            err = PRTE_ERR_JSON_PARSE_FAILURE;
-            PRTE_ERROR_LOG(err);
-            goto cleanup;
-        }
-
-        const char *nodename_string = json_string_value(nodename);
-
-        if (NULL == nodename_string || '\0' == nodename_string[0]) {
+        if(0 >= slot_count) {
             err = PRTE_ERR_BAD_PARAM;
             PRTE_ERROR_LOG(err);
             goto cleanup;
@@ -1253,10 +1244,11 @@ static int prte_ras_slurm_add_modified_resources_jansson(const char *slurm_jobid
 
         PMIX_OUTPUT_VERBOSE((20, prte_ras_base_framework.framework_output,
         "%s ras:slurm:add_modified_resources: discovered node %s with "
-        " %d slots",
-        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), node)); 
+        "%d slots",
+        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), node->name, node->slots)); 
     }
 
+    /* also removes ownership of the nodes */
     err = prte_ras_base_node_insert(&new_nodes, NULL);
 
     if(PRTE_SUCCESS != err) {
@@ -1271,11 +1263,236 @@ static int prte_ras_slurm_add_modified_resources_jansson(const char *slurm_jobid
 
     PMIX_DESTRUCT(&new_nodes);
 
-    free(slurm_json);
-
-    if(root_json_owned) {
+    if(NULL != root) {
         json_decref(root);
     }
+
+    return err;
+}
+
+static size_t prte_ras_slurm_jansson_cbfunc(void *buffer, size_t buflen, void *data) {
+    jansson_limited_reader_t *r = data;
+
+    if (r->remaining == 0) {
+        r->truncated = 1;
+        return 0;
+    }
+
+    if (buflen > r->remaining) {
+        buflen = r->remaining;
+    }
+
+    size_t n = fread(buffer, 1, buflen, r->fp);
+    r->remaining -= n;
+    return n;
+}
+
+static int prte_ras_slurm_get_jobinfo_jansson(const char *slurm_jobid, json_t **job_info_out) {
+
+    if(NULL == slurm_jobid || NULL == job_info_out) {
+        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    *job_info_out = NULL;
+
+    /* Make sure the job ID given is something reasonable */
+    size_t id_len = strnlen(slurm_jobid, PRTE_SLURM_JOB_ID_MAX_LEN+1);
+    if (0 == id_len || id_len > PRTE_SLURM_JOB_ID_MAX_LEN) {
+        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    for (size_t i = 0; i < id_len; ++i) {
+        if (!isdigit((unsigned char)slurm_jobid[i])) {
+            PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
+            return PRTE_ERR_BAD_PARAM;
+        }
+    }
+
+    static const char *cmd_format = "scontrol show job %s --json";
+    
+    int err = PRTE_SUCCESS;
+    json_error_t json_err;
+
+    json_t *parent_json = NULL;
+
+    FILE *fp = NULL;
+
+    char *cmd = NULL;
+
+    if(0 > asprintf(&cmd, cmd_format, slurm_jobid)) {
+        cmd = NULL;
+        err = PRTE_ERR_OUT_OF_RESOURCE;
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
+    }
+
+    fp = popen(cmd, "r");
+
+    if(!fp) {
+        err = PRTE_ERR_FILE_OPEN_FAILURE;
+        goto cleanup;
+    }
+
+    jansson_limited_reader_t lr = {
+        .fp = fp,
+        .remaining = PRTE_SLURM_JOB_INFO_MAX_SIZE,
+        .truncated = false
+    };
+
+    parent_json = json_load_callback(
+        prte_ras_slurm_jansson_cbfunc,
+        &lr,
+        JSON_REJECT_DUPLICATES,
+        &json_err
+    );
+
+    int status = pclose(fp);
+    fp = NULL;
+
+    if (-1 == status) {
+        err = PRTE_ERR_FILE_OPEN_FAILURE;
+        goto cleanup;
+    }
+
+    if (!WIFEXITED(status) || 0 != WEXITSTATUS(status)) {
+        PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
+            "%s ras:slurm:get_full_job_info: non-zero exit code (%d) from scontrol command.",
+            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+            WIFEXITED(status) ? WEXITSTATUS(status) : -1));
+        err = PRTE_ERR_NOT_FOUND;
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
+    }
+
+    if(!parent_json) {
+
+        if(lr.truncated) {
+            PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
+            "%s ras:slurm:get_full_job_info: job info JSON was truncated.",
+            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
+        }
+        else {
+            PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
+            "%s ras:slurm:get_full_job_info: job info JSON parse failed.",
+            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
+        }
+
+        err = PRTE_ERR_JSON_PARSE_FAILURE;
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
+    }
+
+    /* Jobs array: we expect and require exactly one job in the result  */
+    json_t *jobs_arr = json_object_get(parent_json, jobs_field);
+    if (NULL == jobs_arr || !json_is_array(jobs_arr) || 1 != json_array_size(jobs_arr)) {
+        err = PRTE_ERR_JSON_PARSE_FAILURE;
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
+    }
+
+    json_t *job = json_array_get(jobs_arr, 0);
+    if (NULL == job || !json_is_object(job)) {
+        err = PRTE_ERR_JSON_PARSE_FAILURE;
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
+    }
+
+    /* Ensure job information is not destroyedw */
+    json_incref(job);
+
+    *job_info_out = job;
+
+    cleanup:
+
+    if(NULL != fp) {
+        pclose(fp);
+    }
+
+    if(NULL != parent_json) {
+        json_decref(parent_json);
+    }
+
+    free(cmd);
+
+    return err;
+}
+
+static int prte_ras_slurm_wait_resources_jansson(const char *slurm_jobid) {
+    
+    int err = PRTE_SUCCESS;
+
+    json_t *job_info = NULL;
+
+    bool running;
+    bool pending;
+
+    do {
+        running = false;
+        pending = false;
+        err = prte_ras_slurm_get_jobinfo_jansson(slurm_jobid, &job_info);
+
+        if(PRTE_SUCCESS != err) {
+            goto cleanup;
+        }
+
+        json_t *job_states = json_object_get(job_info, "job_state");
+
+        /* A job can have multiple states in Slurm */
+        if (NULL == job_states || !json_is_array(job_states)) {
+            err = PRTE_ERR_JSON_PARSE_FAILURE;
+            PRTE_ERROR_LOG(PRTE_ERR_JSON_PARSE_FAILURE);
+            goto cleanup;
+        }
+        
+        size_t i;
+        json_t *state_val;
+
+        json_array_foreach(job_states, i, state_val) {
+
+            if(!json_is_string(state_val)) {
+                err = PRTE_ERR_JSON_PARSE_FAILURE;
+                PRTE_ERROR_LOG(PRTE_ERR_JSON_PARSE_FAILURE);
+                goto cleanup;
+            }
+
+            const char *state = json_string_value(state_val);
+
+            if (strcmp(state, "RUNNING") == 0) {
+                running = true;
+                break;
+            }
+
+            else if (strcmp(state, "PENDING") == 0) {
+                pending = true;
+                break;
+            }
+        }
+
+        json_decref(job_info);
+        job_info = NULL;
+
+        /* avoid overloading Slurm with requests */
+        if(pending) {
+            sleep(1);
+        }
+
+    } while (pending);
+
+    if(!running) {
+        err = PRTE_ERR_SLURM_BAD_JOB_STATUS;
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
+    }
+
+    cleanup:
+
+    if(NULL != job_info) {
+        json_decref(job_info);
+    }
+
+    return err;
 }
 
 #endif
@@ -1288,7 +1505,7 @@ static int prte_ras_slurm_make_job_field(pmix_hash_table_t *fields, const char *
                         strlen(field_name), (void**)&stored_val);
 
     if(PMIX_SUCCESS != pmix_err) {
-        return PRTE_ERR_NOT_FOUND;
+        return prte_pmix_convert_rc(pmix_err);
     }
 
     if(NULL == stored_val || 0 == strlen(stored_val)) {
@@ -1327,7 +1544,6 @@ static int prte_ras_slurm_launch_expander_job(pmix_hash_table_t *fields) {
 
     const char * const initial_args[] = {"sbatch",
                                 "--wrap=sleep infinity", 
-                                "--wait"
                                 "--parsable",
                                 NULL };
 
@@ -1446,7 +1662,7 @@ static int prte_ras_slurm_launch_expander_job(pmix_hash_table_t *fields) {
         goto cleanup;
     }
 
-    char job_id[PRTE_SLURM_JOB_ID_MAX_SIZE] = {0};
+    char job_id[PRTE_SLURM_JOB_ID_MAX_LEN] = {0};
     err = prte_ras_slurm_exec_sbatch(argv, job_id);
 
     if(PRTE_SUCCESS != err) {
@@ -1487,7 +1703,7 @@ static int prte_ras_slurm_launch_expander_job(pmix_hash_table_t *fields) {
     return err;
 }
 
-static int prte_ras_slurm_exec_sbatch(char * const *argv, char job_id[PRTE_SLURM_JOB_ID_MAX_SIZE]) {
+static int prte_ras_slurm_exec_sbatch(char * const *argv, char job_id[PRTE_SLURM_JOB_ID_MAX_LEN]) {
     
     int err = PRTE_SUCCESS;
 
@@ -1556,7 +1772,7 @@ static int prte_ras_slurm_exec_sbatch(char * const *argv, char job_id[PRTE_SLURM
         if(1 == r && !pipe_draining)
         {
             /* Slurm job ID, exclusively from digits 0-9 */
-            if((n + 1 < PRTE_SLURM_JOB_ID_MAX_SIZE) 
+            if((n + 1 < PRTE_SLURM_JOB_ID_MAX_LEN) 
                 && ('0' <= c && c <= '9')) {
                 job_id[n++] = c;
             }
@@ -1605,10 +1821,10 @@ static int prte_ras_slurm_exec_sbatch(char * const *argv, char job_id[PRTE_SLURM
         if (errno == EINTR) {
             continue; 
         }
-        
+
+        char *strerr = strerror(errno);
         err = PRTE_ERR_IN_ERRNO;
         PRTE_ERROR_LOG(err);
-        char *strerr = strerror(errno);
         PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
         "%s ras:slurm:exec_sbatch: waitpid failed: %s",
         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), strerr));
@@ -1646,118 +1862,3 @@ static int prte_ras_slurm_exec_sbatch(char * const *argv, char job_id[PRTE_SLURM
     return err;
 }
 
-static int prte_ras_slurm_get_full_jobinfo(const char *slurm_jobid, char **job_info_out) {
-
-    if(!job_info_out) {
-        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
-        return PRTE_ERR_BAD_PARAM;
-    }
-
-    static const char *cmd_format = "scontrol show job %s --json";
-    
-    int err = PRTE_SUCCESS;
-    FILE *fp = NULL;
-
-    char *cmd = NULL;
-
-    size_t curr_limit = 4096;
-    size_t len = 0;
-
-    if(0 > asprintf(&cmd, cmd_format, slurm_jobid)) {
-        cmd = NULL;
-        err = PRTE_ERR_OUT_OF_RESOURCE;
-        PRTE_ERROR_LOG(err);
-        goto cleanup;
-    }
-
-    fp = popen(cmd, "r");
-
-    if(!fp) {
-        err = PRTE_ERR_FILE_OPEN_FAILURE;
-        goto cleanup;
-    }
-
-    *job_info_out = malloc(curr_limit);
-
-    if (!(*job_info_out)) {
-        err = PRTE_ERR_OUT_OF_RESOURCE;
-        goto cleanup;
-    }
-
-    char buf[1024];
-    while (fgets(buf, sizeof(buf), fp)) {
-
-        size_t chunk_len = strlen(buf);
-
-        /* verify the chunk can fit within limits */
-        if (chunk_len > PRTE_SLURM_JOB_INFO_MAX_SIZE - len - 1) {
-            err = PRTE_ERR_MEM_LIMIT_EXCEEDED;
-            goto cleanup;
-        }
-
-        size_t needed = len + chunk_len + 1;
-
-        if(curr_limit < needed) {
-
-            size_t new_limit = curr_limit;
-
-            while (needed > new_limit) {
-                if (new_limit > PRTE_SLURM_JOB_INFO_MAX_SIZE / 2) {
-                    new_limit = PRTE_SLURM_JOB_INFO_MAX_SIZE;
-                    break;
-                } else {
-                    new_limit *= 2;
-                }
-            }
-
-            char *job_info_realloc = realloc((*job_info_out), sizeof(char) * new_limit);
-            
-            if(NULL == job_info_realloc) {
-                err = PRTE_ERR_OUT_OF_RESOURCE;
-                goto cleanup;
-            }
-
-            curr_limit = new_limit;
-            (*job_info_out) = job_info_realloc;
-        }
-
-        memcpy((*job_info_out) + len, buf, chunk_len);
-        len += chunk_len;
-    }
-
-    (*job_info_out)[len] = '\0';
-
-    int status = pclose(fp);
-    fp = NULL;
-
-    if(0 != status) {
-        PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
-        "%s ras:slurm:get_full_job_info: non-zero exit code "
-        " (%d) from scontrol command.",
-        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), status));
-        err = PRTE_ERR_NOT_FOUND;
-        goto cleanup;
-    }
-
-    if(0 == strlen((*job_info_out))) {
-        PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
-        "%s ras:slurm:get_full_job_info: got empty output "
-        "from scontrol command.",
-        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
-        err = PRTE_ERR_NOT_FOUND;
-        goto cleanup;
-    }
-
-    cleanup:
-
-    if(NULL != fp) {
-        pclose(fp);
-    }
-
-    if(PRTE_SUCCESS != err) {
-        free(*job_info_out);
-        *job_info_out = NULL;
-    }
-
-    free(cmd);
-}
