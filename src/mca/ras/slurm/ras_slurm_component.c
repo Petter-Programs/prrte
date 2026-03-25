@@ -125,6 +125,13 @@ static int ras_slurm_register(void)
                                                 PMIX_MCA_BASE_VAR_TYPE_BOOL,
                                                 &prte_mca_ras_slurm_component.propagate_time);
 
+    prte_mca_ras_slurm_component.propagate_threads_per_core = true;
+    (void) pmix_mca_base_component_var_register(component, "propagate_threads_per_core",
+                                                "Propagate threads per core of original job when requesting additional resources",
+                                                PMIX_MCA_BASE_VAR_TYPE_BOOL,
+                                                &prte_mca_ras_slurm_component.propagate_threads_per_core);
+
+
     return PRTE_SUCCESS;
 }
 

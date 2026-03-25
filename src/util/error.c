@@ -412,8 +412,17 @@ const char *prte_strerror(int errnum)
     case PRTE_ERR_JSON_PARSE_FAILURE:
         retval = "Failed to parse input JSON";
         break;
+    case PRTE_ERR_SLURM_QUERY_FAILURE:
+        retval = "Failed to query Slurm job for information";
+        break;
     case PRTE_ERR_SLURM_SUBMIT_FAILURE:
         retval = "Request for new resources from Slurm failed";
+        break;
+    case PRTE_ERR_SLURM_CANCEL_FAILURE:
+        retval = "Request to cancel Slurm job failed";
+        break;
+    case PRTE_ERR_SLURM_SHRINK_FAILURE:
+        retval = "Request to shrink Slurm job failed";
         break;
     case PRTE_ERR_SLURM_BAD_JOB_STATUS:
         retval = "Found a pending Slurm job in an unexpected state";
