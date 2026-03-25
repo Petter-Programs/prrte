@@ -104,14 +104,14 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table);
 static int prte_ras_slurm_make_sbatch_arg(pmix_hash_table_t *fields, const char *field_name, const char *field_format, bool obj_num, int *argc, char **argv);
 static int prte_ras_slurm_launch_expander_job(pmix_hash_table_t *fields);
 static int prte_ras_slurm_exec_sbatch(char * const *argv, char *job_id);
-static int prte_ras_slurm_add_modified_resources(const char *slurm_jobid);
+static int prte_ras_slurm_add_modified_resources(const char *slurm_jobid, pmix_list_t *node_list);
 static int prte_ras_slurm_wait_resources(const char *slurm_jobid);
 static int prte_ras_slurm_kill_job(const char *slurm_jobid, char *err_msg);
 static int prte_ras_slurm_validate_jobid(const char *slurm_jobid);
 #ifdef HAVE_JANSSON
 static int prte_ras_slurm_get_json_numobj_field(json_t *job, const char *key, pmix_hash_table_t *values_table);
 static int prte_ras_slurm_extract_job_fields_jansson(pmix_hash_table_t *values_table);
-static int prte_ras_slurm_add_modified_resources_jansson(const char *slurm_jobid);
+static int prte_ras_slurm_add_modified_resources_jansson(const char *slurm_jobid, pmix_list_t *node_list);
 static int prte_ras_slurm_wait_resources_jansson(const char *slurm_jobid);
 static int prte_ras_slurm_get_jobinfo_jansson(const char *slurm_jobid, json_t **job_info_out);
 #endif
@@ -347,13 +347,18 @@ static void modify(prte_pmix_server_req_t *req) {
     int pmix_err = PMIX_SUCCESS;
 
     pmix_hash_table_t slurm_jobfields;
-    bool have_slurm_jobfields = false;
+    pmix_list_t added_nodes;
 
+    bool have_slurm_jobfields = false;
+    bool have_added_nodes = false;
+    
     char *nodes_string = NULL;
 
     if(PMIX_ALLOC_EXTEND == req->allocdir) {
      
         PMIX_CONSTRUCT(&slurm_jobfields, pmix_hash_table_t);
+
+        have_slurm_jobfields = true;
 
         pmix_err = pmix_hash_table_init(&slurm_jobfields, total_fields_len);
 
@@ -362,7 +367,7 @@ static void modify(prte_pmix_server_req_t *req) {
             PRTE_ERROR_LOG(err);
             goto cleanup;
         }
-
+        
         err = prte_ras_slurm_extract_job_fields(&slurm_jobfields);
 
         if(PRTE_SUCCESS != err) {
@@ -392,7 +397,7 @@ static void modify(prte_pmix_server_req_t *req) {
                     "%s ras:slurm:modify: modify request invalid",
                     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
 
-            err = PRTE_ERR_NOT_FOUND;
+            err = PRTE_ERR_REQUEST;
             goto cleanup;
         }
 
@@ -435,11 +440,17 @@ static void modify(prte_pmix_server_req_t *req) {
             goto cleanup;
         }
 
-        err = prte_ras_slurm_add_modified_resources(job_id);
+        PMIX_CONSTRUCT(&added_nodes, pmix_list_t);
+
+        have_added_nodes = true;
+
+        err = prte_ras_slurm_add_modified_resources(job_id, &added_nodes);
 
         if(PRTE_SUCCESS != err) {
             goto cleanup;
         }
+
+
     }
 
     cleanup:
@@ -448,8 +459,11 @@ static void modify(prte_pmix_server_req_t *req) {
 
     if(have_slurm_jobfields) {
         prte_ras_slurm_wipe_dyn_hashtable(&slurm_jobfields);
-
         PMIX_DESTRUCT(&slurm_jobfields);
+    }
+
+    if(have_added_nodes) {
+        PMIX_DESTRUCT(&added_nodes);
     }
 
     req->status = err;
@@ -918,11 +932,12 @@ static int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table) {
  *
  * Wrapper around the Jansson-based implementation when available.
  *
- * @param[in] slurm_jobid Slurm job identifier.
+ * @param[in] slurm_jobid Slurm job ID.
+ * @param[in,out] node_list A pmix_list_t to add nodes to.
  */
-static int prte_ras_slurm_add_modified_resources(const char *slurm_jobid) {
+static int prte_ras_slurm_add_modified_resources(const char *slurm_jobid, pmix_list_t *node_list) {
 #ifdef HAVE_JANSSON
-    return prte_ras_slurm_add_modified_resources_jansson(slurm_jobid);
+    return prte_ras_slurm_add_modified_resources_jansson(slurm_jobid, node_list);
 #else
     pmix_output(0,
                     "ras:slurm:add_modified_resources: feature requires the Jansson "
@@ -1145,7 +1160,7 @@ static int prte_ras_slurm_get_json_numobj_field(json_t *job, const char *key, pm
 }
 
 /*
- * Parse Slurm job resource JSON and add allocated nodes and slots.
+ * Fetch and parse Slurm job resource JSON and add allocated nodes and slots.
  *
  * Given a Slurm job ID, this function retrieves the job resource description,
  * validates the expected JSON structure, and creates one node entry for
@@ -1157,13 +1172,14 @@ static int prte_ras_slurm_get_json_numobj_field(json_t *job, const char *key, pm
  *
  * slots = min(allocated_cores * threads_per_core, cpus.count)
  *
- * The resulting nodes are inserted into PRTE's global node list.
+ * The resulting nodes are inserted into the provided node list.
  *
  * @param[in] slurm_jobid Slurm job ID.
+ * @param[in,out] node_list. A pmix_list_t to add nodes to.
  */
-static int prte_ras_slurm_add_modified_resources_jansson(const char *slurm_jobid) {
+static int prte_ras_slurm_add_modified_resources_jansson(const char *slurm_jobid, pmix_list_t *node_list) {
 
-    if(NULL == slurm_jobid) {
+    if(NULL == slurm_jobid || NULL == node_list) {
         PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
         return PRTE_ERR_BAD_PARAM;
     }
@@ -1180,9 +1196,6 @@ static int prte_ras_slurm_add_modified_resources_jansson(const char *slurm_jobid
     int threads_per_core = 1;
 
     json_t *root = NULL;
-
-    pmix_list_t new_nodes;
-    PMIX_CONSTRUCT(&new_nodes, pmix_list_t);
 
     err = prte_ras_slurm_get_jobinfo_jansson(slurm_jobid, &root);
 
@@ -1431,7 +1444,7 @@ static int prte_ras_slurm_add_modified_resources_jansson(const char *slurm_jobid
         node->slots_max = 0;
         node->slots = slots;
 
-        pmix_list_append(&new_nodes, &node->super);
+        pmix_list_append(node_list, &node->super);
 
         PMIX_OUTPUT_VERBOSE((20, prte_ras_base_framework.framework_output,
         "%s ras:slurm:add_modified_resources: discovered node %s with "
@@ -1439,20 +1452,7 @@ static int prte_ras_slurm_add_modified_resources_jansson(const char *slurm_jobid
         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), node->name, node->slots)); 
     }
 
-    /* This function removes ownership of successfully inserted nodes */
-    err = prte_ras_base_node_insert(&new_nodes, NULL);
-
-    if(PRTE_SUCCESS != err) {
-        PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
-        "%s ras:slurm:add_modified_resources: error inserting new "
-        "nodes into global list.",
-        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME))); 
-        goto cleanup;
-    }
-
     cleanup:
-
-    PMIX_DESTRUCT(&new_nodes);
 
     if(NULL != root) {
         json_decref(root);
@@ -2320,4 +2320,84 @@ static int prte_ras_slurm_kill_job(const char *slurm_jobid, char *err_msg) {
     free(cmd);
 
     return err;
+}
+
+int prte_ras_slurm_assign_new_session(const char *slurm_jobid, const char *alloc_refid) {
+    
+    if(NULL == slurm_jobid) {
+        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    int err = PRTE_SUCCESS;
+
+    err = prte_ras_slurm_validate_jobid(slurm_jobid);
+
+    if(PRTE_SUCCESS != err) {
+        PRTE_ERROR_LOG(err);
+        return err;
+    }
+    
+    const int base = 10;
+    char *end = NULL;
+
+    uint32_t slurm_id_uint;
+    unsigned long slurm_id_ulong;
+    
+    errno = 0;
+    id_ulong = strtoul(slurm_jobid, &end, base);
+
+    if (end == slurm_jobid || '\0' != end
+     || errno == ERANGE || id_ulong > UINT32_MAX) {
+        err = PRTE_ERR_BAD_PARAM;
+        PRTE_ERROR_LOG(err);
+        return err;
+    }
+
+    id_uint = (uint32_t)id_ulong;
+
+    char *alloc_refid_dup = NULL;
+
+    if(NULL != alloc_refid) {
+        alloc_refid_dup = strdup(alloc_refid);
+        if(NULL == alloc_refid_dup) {
+            err = PRTE_ERR_OUT_OF_RESOURCE;
+            PRTE_ERROR_LOG(err);
+            return err;
+        }
+    }
+
+    prte_session_t *session = NULL;
+
+    session = PMIX_NEW(prte_session_t);
+
+    session->session_id = slurm_id_uint;
+
+    if(NULL != alloc_refid_dup) {
+        session->alloc_refid = alloc_refid_dup;
+    }
+
+    PMIX_LIST_FOREACH(node, nodes, prte_node_t) {
+        PMIX_RETAIN(node);
+
+        int idx = pmix_pointer_array_add(session->nodes, nd);
+        if (0 > idx) {
+            PMIX_RELEASE(nd);
+            PMIX_RELEASE(session);
+            return PRTE_ERR_OUT_OF_RESOURCE;
+        }
+    }
+
+    err = prte_set_session_object(session);
+    if (PRTE_SUCCESS != err) {
+        PMIX_RELEASE(session);
+        PRTE_ERROR_LOG(err);
+        free(alloc_refid_dup);
+        return err;
+    }
+
+    /* Now owned by the session */
+    alloc_refid_dup = NULL;
+
+
 }
