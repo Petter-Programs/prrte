@@ -209,6 +209,16 @@ static int prte_ras_slurm_allocate(prte_job_t *jdata, pmix_list_t *nodes)
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
         return ret;
     }
+
+    ret = prte_ras_slurm_assign_new_session(slurm_jobid, NULL, nodes);
+    
+    if(PRTE_SUCCESS != ret) {
+        PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
+                             "%s ras:slurm:allocate: failed to assign new session",
+                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
+        return ret;
+    }
+    
     /* record the number of allocated nodes */
     prte_num_allocated_nodes = pmix_list_get_size(nodes);
 
@@ -604,4 +614,187 @@ static int prte_ras_slurm_parse_range(char *base, char *range, char ***names)
 
     /* All done */
     return PRTE_SUCCESS;
+}
+
+
+/*
+ * Validate that a Slurm job ID is valid according to expected syntax
+ *
+ * A valid Slurm job ID must be non-NULL, non-empty, must not exceed
+ * PRTE_SLURM_JOB_ID_MAX_LEN characters, and must contain only decimal digits.
+ *
+ * @param[in] slurm_jobid  Null-terminated Slurm job ID string to validate.
+ */
+int prte_ras_slurm_validate_jobid(const char *slurm_jobid) {
+
+    if (NULL == slurm_jobid) {
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    size_t id_len = strnlen(slurm_jobid, PRTE_SLURM_JOB_ID_MAX_LEN+1);
+    if (0 == id_len || id_len > PRTE_SLURM_JOB_ID_MAX_LEN) {
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    for (size_t i = 0; i < id_len; ++i) {
+        if (!isdigit((unsigned char)slurm_jobid[i])) {
+            return PRTE_ERR_BAD_PARAM;
+        }
+    }
+
+    return PRTE_SUCCESS;
+}
+
+/*
+ * Convert a Slurm job ID string to uint32_t.
+ *
+ * Expects a strictly decimal, non-negative string.
+ *
+ * @param[in]  slurm_jobid           Input string containing digits only.
+ * @param[out] slurm_jobid_numeric   Converted value.
+ */
+int prte_ras_slurm_convert_jobid(const char *slurm_jobid, uint32_t *slurm_jobid_numeric) {
+
+    if (NULL == slurm_jobid || NULL == slurm_jobid_numeric) {
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    if (!isdigit((unsigned char)slurm_jobid[0])) {
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    char *end = NULL;
+
+    unsigned long slurm_id_ulong;
+
+    errno = 0;
+    slurm_id_ulong = strtoul(slurm_jobid, &end, 10);
+
+    if ('\0' != *end || ERANGE == errno || slurm_id_ulong > UINT32_MAX) {
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    *slurm_jobid_numeric = (uint32_t)slurm_id_ulong;
+
+    return PRTE_SUCCESS;
+}
+
+/*
+ * Create and register a PRRTE session from a node list belonging to a Slurm allocation.
+ *
+ * Creates a new prte_session_t using slurm_jobid as the session ID,
+ * associates the nodes in node_list with the session, and adds it to
+ * the global session table.
+ *
+ * @param[in] slurm_jobid  Slurm job ID string (must be convertible to uint32_t)
+ * @param[in] user_refid   Optional user-provided allocation reference ID (may be NULL)
+ * @param[in] node_list    List of prte_node_t to attach to the session
+ */
+int prte_ras_slurm_assign_new_session(const char *slurm_jobid, const char *user_refid, pmix_list_t *node_list)
+{
+    if(NULL == slurm_jobid || NULL == node_list) {
+        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    int err = PRTE_SUCCESS;
+
+    err = prte_ras_slurm_validate_jobid(slurm_jobid);
+
+    if(PRTE_SUCCESS != err) {
+        PRTE_ERROR_LOG(err);
+        return err;
+    }
+
+    prte_session_t *session = NULL;
+
+    uint32_t slurm_id_uint;
+
+    err = prte_ras_slurm_convert_jobid(slurm_jobid, &slurm_id_uint);
+
+    if(PRTE_SUCCESS != err) {
+        PRTE_ERROR_LOG(err);
+        return err;
+    }
+
+    char *user_refid_dup = NULL;
+
+    if(NULL != user_refid) {
+        user_refid_dup = strdup(user_refid);
+        if(NULL == user_refid_dup) {
+            err = PRTE_ERR_OUT_OF_RESOURCE;
+            PRTE_ERROR_LOG(err);
+            return err;
+        }
+    }
+
+    char *slurm_jobid_dup = NULL;
+
+    slurm_jobid_dup = strdup(slurm_jobid);
+    if(NULL == slurm_jobid_dup) {
+        err = PRTE_ERR_OUT_OF_RESOURCE;
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
+    }
+
+    session = PMIX_NEW(prte_session_t);
+
+    if (NULL == session) {
+        err = PRTE_ERR_OUT_OF_RESOURCE;
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
+    }
+
+    session->session_id = slurm_id_uint;
+
+    if(NULL != user_refid_dup) {
+        session->user_refid = user_refid_dup;
+        /* Now owned by the session */
+        user_refid_dup = NULL;
+    }
+
+    session->alloc_refid = slurm_jobid_dup;
+    slurm_jobid_dup = NULL;
+
+    prte_node_t *node = NULL;
+
+    PMIX_LIST_FOREACH(node, node_list, prte_node_t) {
+
+        /* Tag the nodes with the session ID */
+        err = prte_set_attribute(&node->attributes, PRTE_NODE_ALLOC_ID, PRTE_ATTR_LOCAL,
+            &slurm_id_uint, PMIX_UINT32);
+
+        if(PRTE_SUCCESS != err) {
+            PRTE_ERROR_LOG(err);
+            goto cleanup;
+        }
+
+        PMIX_RETAIN(node);
+
+        int idx = pmix_pointer_array_add(session->nodes, node);
+        if (0 > idx) {
+            /* Negative returned idx indicates PMIX error */
+            err = prte_pmix_convert_status(idx);
+            PMIX_RELEASE(node);
+            PRTE_ERROR_LOG(err);
+            goto cleanup;
+        }
+    }
+
+    err = prte_set_session_object(session);
+    if (PRTE_SUCCESS != err) {
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
+    }
+
+    cleanup:
+
+    free(user_refid_dup);
+    free(slurm_jobid_dup);
+
+    if(NULL != session && err != PRTE_SUCCESS) {
+        PMIX_RELEASE(session);
+    }
+
+    return err;
 }
