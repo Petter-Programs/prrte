@@ -175,6 +175,7 @@ static void launch_daemons(int fd, short args, void *cbdata)
     prte_node_t *node;
     int32_t n;
     prte_job_map_t *map;
+    prte_session_t *session;
     char *param;
     char **argv = NULL;
     int argc;
@@ -189,6 +190,7 @@ static void launch_daemons(int fd, short args, void *cbdata)
     char *pmix_prefix = NULL;
     int proc_vpid_index;
     bool failed_launch = true;
+    uint32_t job_id = UINT32_MAX;
     prte_job_t *daemons;
     prte_state_caddy_t *state = (prte_state_caddy_t *) cbdata;
     PRTE_HIDE_UNUSED_PARAMS(fd, args);
@@ -290,6 +292,48 @@ static void launch_daemons(int fd, short args, void *cbdata)
         PMIx_Argv_free(custom_strings);
     }
 
+    /* Iterate through the node list and find the first non-null,
+    * non-launched node's Slurm job ID. We assume job IDs do not
+    * overlap: if one node in the mapping has a job ID, all mapped
+    * nodes should share the same ID.
+    */
+    for (n = 0; n < map->nodes->size; n++) {
+        node = (prte_node_t *) pmix_pointer_array_get_item(map->nodes, n);
+
+        /* Skip NULL and already launched nodes */
+        if (NULL == node || PRTE_FLAG_TEST(node, PRTE_NODE_FLAG_DAEMON_LAUNCHED)) {
+            continue;
+        }
+        
+        uint32_t node_job_id;
+        void *data = &node_job_id;
+        if(prte_get_attribute(&node->attributes, PRTE_NODE_ALLOC_ID, &data, PMIX_UINT32)) {
+            job_id = node_job_id;
+            break;
+        }
+
+        /* found a node not tagged with an allocation ID */
+        rc = PRTE_ERR_NOT_FOUND;
+        goto cleanup;
+    }
+
+    /* all nodes NULL or already launched */
+    if(UINT32_MAX == job_id) {
+        pmix_show_help("help-plm-slurm.txt", "no-hosts-in-list", true);
+        rc = PRTE_ERR_FAILED_TO_START;
+        goto cleanup;
+    }
+
+    session = prte_get_session_object(job_id);
+
+    if(NULL == session) {
+        rc = PRTE_ERR_NOT_FOUND;
+        PRTE_ERROR_LOG(rc);
+        goto cleanup;
+    }
+
+    int nodes_in_session = session->nodes->size;
+
     /* create nodelist */
     nodelist_argv = NULL;
 
@@ -309,18 +353,14 @@ static void launch_daemons(int fd, short args, void *cbdata)
          */
         PMIx_Argv_append_nosize(&nodelist_argv, node->name);
     }
-    if (0 == PMIx_Argv_count(nodelist_argv)) {
-        pmix_show_help("help-plm-slurm.txt", "no-hosts-in-list", true);
-        rc = PRTE_ERR_FAILED_TO_START;
-        goto cleanup;
-    }
+
     nodelist_flat = PMIx_Argv_join(nodelist_argv, ',');
     PMIx_Argv_free(nodelist_argv);
 
     /* if we are using all allocated nodes, then srun doesn't
      * require any further arguments
      */
-    if (map->num_new_daemons < prte_num_allocated_nodes) {
+    if (map->num_new_daemons < nodes_in_session) {
         pmix_asprintf(&tmp, "--nodes=%lu", (unsigned long) map->num_new_daemons);
         pmix_argv_append(&argc, &argv, tmp);
         free(tmp);
@@ -330,13 +370,20 @@ static void launch_daemons(int fd, short args, void *cbdata)
         free(tmp);
     }
 
+    /* By specifying a job ID explicitly, we can launch
+    *  daemons into other allocations than the one we are in,
+    *  if necessary. */
+    pmix_asprintf(&tmp, "--jobid=%"PRIu32, job_id);
+    pmix_argv_append(&argc, &argv, tmp);
+    free(tmp);
+
     /* tell srun how many tasks to run */
     pmix_asprintf(&tmp, "--ntasks=%lu", (unsigned long) map->num_new_daemons);
     pmix_argv_append(&argc, &argv, tmp);
     free(tmp);
 
     PMIX_OUTPUT_VERBOSE((2, prte_plm_base_framework.framework_output,
-                         "%s plm:slurm: launching on nodes %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                         "%s plm:slurm: launching for job ID %" PRIu32 " on nodes %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                          nodelist_flat));
     free(nodelist_flat);
 
