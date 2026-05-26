@@ -14,6 +14,8 @@
  * Copyright (c) 2014-2020 Intel, Inc.  All rights reserved.
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
  * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2026      Barcelona Supercomputing Center (BSC-CNS).
+ *                         All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -211,6 +213,7 @@ typedef int8_t prte_node_state_t;
 #define PRTE_NODE_STATE_DO_NOT_USE   5 // Node is up, but not available for use for the next mapping
 #define PRTE_NODE_STATE_NOT_INCLUDED 6 // Node is up, but not part of the node pool for jobs
 #define PRTE_NODE_STATE_ADDED        7 // Node was dynamically added to pool
+#define PRTE_NODE_STATE_REMOVED      8 // Node is to be dynamically removed from pool
 
 /* Define a boundary so that external developers
  * have a starting point for defining their own
