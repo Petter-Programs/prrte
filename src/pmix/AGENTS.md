@@ -128,6 +128,11 @@ answer, so no error is logged anywhere. **Use the `PRTE_PROC_STATE_*` and
 
 Two properties to preserve:
 
+- **PRRTE-only states collapse too.** `PRTE_PROC_STATE_KILLED_BY_SHRINK` maps
+  to `PMIX_ERR_JOB_KILLED_BY_SHRINK`, or to `PMIX_ERR_JOB_CANCELED` on a PMIx
+  that predates it. There is no matching PMIx proc *state*, so
+  `convert_state` answers `PMIX_PROC_STATE_KILLED_BY_CMD`; that is lossy and
+  `test_state_roundtrip` exempts it.
 - **Collapses must agree.** PRRTE has six ways to say "lost touch with a
   peer" (`COMM_FAILED`, `UNABLE_TO_SEND_MSG`, `LIFELINE_LOST`,
   `NO_PATH_TO_TARGET`, `FAILED_TO_CONNECT`, `PEER_UNKNOWN`). PMIx has one
