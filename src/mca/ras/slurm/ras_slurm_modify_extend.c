@@ -117,7 +117,8 @@ static int prte_ras_slurm_add_reused_nodes_to_session(const char *slurm_jobid,
                                                       pmix_pointer_array_t *reused_nodes);
 static void prte_ras_slurm_rollback_session(const char *slurm_jobid);
 static int prte_ras_slurm_vet_node_list(char **names, uint64_t *count);
-static int prte_ras_slurm_limit_to_parent_remainder(pmix_hash_table_t *fields);
+static int prte_ras_slurm_limit_to_parent_remainder(pmix_hash_table_t *fields,
+                                                   time_t parent_end);
 static int prte_ras_slurm_trim_job_to_parent(const char *slurm_jobid, int num_nodes);
 static void prte_ras_slurm_extend_wait_complete(int fd, short args, void *cbdata);
 static void slurm_grant_check_cb(int fd, short args, void *cbdata);
@@ -181,6 +182,7 @@ static void swt_con(prte_slurm_wait_tracker_t *p)
     p->request_id = NULL;
     p->user_request_id_provided = false;
     p->job_id = NULL;
+    p->num_nodes = 0;
     p->err = PRTE_SUCCESS;
     p->retry_delay_usec = PRTE_SLURM_GRANT_RETRY_MIN_USEC;
     p->attempts = 0;
@@ -1235,32 +1237,15 @@ static int prte_ras_slurm_vet_node_list(char **names, uint64_t *count)
  *
  * @param[in,out] fields Job fields to rewrite in place.
  */
-static int prte_ras_slurm_limit_to_parent_remainder(pmix_hash_table_t *fields)
+static int prte_ras_slurm_limit_to_parent_remainder(pmix_hash_table_t *fields,
+                                                   time_t parent_end)
 {
     const char *key = num_obj_fields[NUM_OBJ_TIME_LIMIT];
-    char *parent_jobid;
     char *minutes_string = NULL;
     void *old_value = NULL;
-    time_t parent_end = 0;
     long minutes;
-    int parent_nodes;
     int err;
     int pmix_err;
-
-    parent_jobid = prte_common_slurm_jobid();
-    if (NULL == parent_jobid) {
-        return PRTE_ERR_NOT_FOUND;
-    }
-
-    err = prte_ras_slurm_session_node_count(parent_jobid, &parent_nodes);
-    if (PRTE_SUCCESS != err) {
-        return err;
-    }
-
-    err = prte_ras_slurm_get_job_times(parent_jobid, parent_nodes, NULL, &parent_end);
-    if (PRTE_SUCCESS != err) {
-        return err;
-    }
 
     if (0 == parent_end) {
         return PRTE_SUCCESS;
@@ -1293,8 +1278,8 @@ static int prte_ras_slurm_limit_to_parent_remainder(pmix_hash_table_t *fields)
 
     PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
                          "%s ras:slurm:extend: asking for %ld minute(s), what is"
-                         " left of parent job %s",
-                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), minutes, parent_jobid));
+                         " left of the parent allocation",
+                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), minutes));
 
     return PRTE_SUCCESS;
 }
@@ -1799,6 +1784,7 @@ int prte_ras_slurm_serve_extend_req(prte_pmix_server_req_t *req)
     bool found = false;
     char *node_string = NULL;
     char **node_names = NULL;
+    time_t parent_end = 0;
 
     for (size_t i = 0; i < req->ninfo; i++) {
 
@@ -1876,7 +1862,7 @@ int prte_ras_slurm_serve_extend_req(prte_pmix_server_req_t *req)
         goto cleanup;
     }
     
-    err = prte_ras_slurm_extract_job_fields(&slurm_jobfields);
+    err = prte_ras_slurm_extract_job_fields(&slurm_jobfields, NULL, &parent_end);
 
     if(PRTE_SUCCESS != err) {
         goto cleanup;
@@ -1887,7 +1873,8 @@ int prte_ras_slurm_serve_extend_req(prte_pmix_server_req_t *req)
      * if generous, request, and the trim at the grant is what makes the
      * window exact. */
     if (prte_mca_ras_slurm_component.propagate_time) {
-        int limit_err = prte_ras_slurm_limit_to_parent_remainder(&slurm_jobfields);
+        int limit_err = prte_ras_slurm_limit_to_parent_remainder(&slurm_jobfields,
+                                                                 parent_end);
 
         if (PRTE_SUCCESS != limit_err) {
             pmix_output(0, "ras:slurm:modify: could not reduce the requested time"

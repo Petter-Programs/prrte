@@ -56,6 +56,7 @@ static int prte_ras_slurm_get_jobinfo_json(const char *slurm_jobid, int expected
                                            json_t **job_info_out);
 static size_t prte_ras_slurm_jansson_cbfunc(void *buffer, size_t buflen, void *data);
 static size_t prte_ras_slurm_job_info_budget(int expected_nodes);
+static int prte_ras_slurm_read_job_times(json_t *job, time_t *start_time, time_t *end_time);
 
 /* Bounded reader for Slurm JSON output */
 typedef struct {
@@ -431,7 +432,8 @@ bool prte_ras_slurm_have_jansson(void)
 
  * Note: On failure, values_table may be partially populated.
  */
-int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
+int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table, time_t *start_time,
+                                      time_t *end_time)
 {
     if(NULL == values_table) {
         PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
@@ -531,6 +533,15 @@ int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
             goto cleanup;
         }
 
+    }
+
+    /* Record the job end time so we know what to trim the job to without
+     * paying for another query. */
+    err = prte_ras_slurm_read_job_times(job, start_time, end_time);
+
+    if (PRTE_SUCCESS != err) {
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
     }
 
     cleanup:
@@ -1201,56 +1212,39 @@ static int prte_ras_slurm_get_json_numobj_value(json_t *job, const char *key, in
 }
 
 /*
- * Read a job's start and end times, in seconds since the epoch.
+ * Read a job's start and end times out of a record already in hand.
  *
- * Either output may be NULL. A time Slurm does not report comes back as 0, as
- * does the end of a job with no time limit: Slurm prints an end_time for one
- * anyway - its start plus a year - which is a placeholder, not a deadline.
+ * Either output may be NULL. Times Slurm does not report come back as 0, and
+ * so does the end of a job with no time limit, since the end_time Slurm
+ * prints for one is just its start plus a year.
  *
- * end_time is the start plus the CURRENT time limit, so it answers "when does
- * this allocation end" only once the job is running.
- *
- * @param[in]  slurm_jobid Slurm job ID to query.
- * @param[in]  expected_nodes Nodes this job is expected to hold.
- * @param[out] start_time  Job start time, or 0.
- * @param[out] end_time    Job end time, or 0 if it has none.
+ * @param[in]  job        Parsed Slurm job record.
+ * @param[out] start_time Job start time, or 0.
+ * @param[out] end_time   Job end time, or 0 if it has none.
  */
-int prte_ras_slurm_get_job_times(const char *slurm_jobid, int expected_nodes,
-                                 time_t *start_time, time_t *end_time)
+static int prte_ras_slurm_read_job_times(json_t *job, time_t *start_time, time_t *end_time)
 {
-    int err = PRTE_SUCCESS;
-    json_t *job_info = NULL;
     int64_t time_limit = 0;
     int64_t start = 0;
     int64_t end = 0;
+    int err;
 
-    if (NULL == slurm_jobid) {
-        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
+    if (NULL == job) {
         return PRTE_ERR_BAD_PARAM;
     }
 
-    err = prte_ras_slurm_get_jobinfo_json(slurm_jobid, expected_nodes, &job_info);
-
-    if (PRTE_SUCCESS != err) {
-        return err;
-    }
-
-    err = prte_ras_slurm_get_json_numobj_value(job_info, "start_time", &start);
+    err = prte_ras_slurm_get_json_numobj_value(job, "start_time", &start);
 
     if (PRTE_SUCCESS == err) {
-        err = prte_ras_slurm_get_json_numobj_value(job_info, "end_time", &end);
+        err = prte_ras_slurm_get_json_numobj_value(job, "end_time", &end);
     }
 
     if (PRTE_SUCCESS == err) {
-        err = prte_ras_slurm_get_json_numobj_value(job_info,
-                                                   num_obj_fields[NUM_OBJ_TIME_LIMIT],
+        err = prte_ras_slurm_get_json_numobj_value(job, num_obj_fields[NUM_OBJ_TIME_LIMIT],
                                                    &time_limit);
     }
 
-    json_decref(job_info);
-
     if (PRTE_SUCCESS != err) {
-        PRTE_ERROR_LOG(err);
         return err;
     }
 
@@ -1266,5 +1260,48 @@ int prte_ras_slurm_get_job_times(const char *slurm_jobid, int expected_nodes,
         *end_time = (time_t) end;
     }
 
+    return PRTE_SUCCESS;
+}
+
+/*
+ * Read a job's start and end times, in seconds since the epoch.
+ *
+ * Either output may be NULL. Times Slurm does not report come back as 0, and
+ * so does the end of a job with no time limit, since the end_time Slurm
+ * prints for one is just its start plus a year.
+ *
+ * Slurm derives end_time from the job's current time limit, so it describes
+ * the end of the allocation only once the job is running.
+ *
+ * @param[in]  slurm_jobid Slurm job ID to query.
+ * @param[in]  expected_nodes Nodes this job is expected to hold.
+ * @param[out] start_time  Job start time, or 0.
+ * @param[out] end_time    Job end time, or 0 if it has none.
+ */
+int prte_ras_slurm_get_job_times(const char *slurm_jobid, int expected_nodes,
+                                 time_t *start_time, time_t *end_time)
+{
+    int err = PRTE_SUCCESS;
+    json_t *job_info = NULL;
+
+    if (NULL == slurm_jobid) {
+        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    err = prte_ras_slurm_get_jobinfo_json(slurm_jobid, expected_nodes, &job_info);
+
+    if (PRTE_SUCCESS != err) {
+        return err;
+    }
+
+    err = prte_ras_slurm_read_job_times(job_info, start_time, end_time);
+
+    json_decref(job_info);
+
+    if (PRTE_SUCCESS != err) {
+        PRTE_ERROR_LOG(err);
+        return err;
+    }
     return PRTE_SUCCESS;
 }
