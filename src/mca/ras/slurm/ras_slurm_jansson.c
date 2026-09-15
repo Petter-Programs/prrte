@@ -33,6 +33,7 @@
 
 #include "src/mca/errmgr/errmgr.h"
 #include "src/util/pmix_output.h"
+#include "src/util/prte_show_help.h"
 #include "src/runtime/prte_globals.h"
 #include "src/util/name_fns.h"
 
@@ -308,6 +309,12 @@ static int prte_ras_slurm_get_jobinfo_json(const char *slurm_jobid, int expected
     int status = pclose(fp);
     fp = NULL;
 
+    PMIX_OUTPUT_VERBOSE((5, prte_ras_base_framework.framework_output,
+        "%s ras:slurm:get_jobinfo_json: job %s read %lu bytes of %lu allowed for %d node%s",
+        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), slurm_jobid,
+        (unsigned long) ((0 == budget) ? (SIZE_MAX - lr.remaining) : (budget - lr.remaining)),
+        (unsigned long) budget, expected_nodes, (1 == expected_nodes) ? "" : "s"));
+
     if (-1 == status) {
         pmix_output(0, "ras:slurm:get_jobinfo_json: pclose failed: %s.", strerror(errno));
         err = PRTE_ERR_IN_ERRNO;
@@ -322,10 +329,10 @@ static int prte_ras_slurm_get_jobinfo_json(const char *slurm_jobid, int expected
     if (NULL == parent_json) {
         if (lr.truncated) {
             err = PRTE_ERR_MEM_LIMIT_EXCEEDED;
-            PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
-                "%s ras:slurm:get_jobinfo_json: job info JSON was truncated.",
-                PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
-            PRTE_ERROR_LOG(err);
+            prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-ras-slurm.txt",
+                           "slurm-job-info-too-large", true,
+                           slurm_jobid, (unsigned long) budget, expected_nodes,
+                           (unsigned long) prte_mca_ras_slurm_component.job_info_bytes_per_node);
             goto cleanup;
         }
 

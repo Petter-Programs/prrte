@@ -13,6 +13,8 @@
 # Copyright (c) 2019-2020 Intel, Inc.  All rights reserved.
 # Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
 # Copyright (c) 2024-2025 Nanook Consulting  All rights reserved.
+# Copyright (c) 2026      Barcelona Supercomputing Center (BSC-CNS).
+#                         All rights reserved.
 # $COPYRIGHT$
 #
 # Additional copyrights may follow
@@ -57,3 +59,24 @@ The variable was found, but a length check has failed, indicating that
 the envar is more than %d characters long. This indicates that the envar
 may be tainted. We will therefore not print it out. However, if you check
 and feel it is valid, then please adjust the length limit and try again.
+#
+[slurm-job-info-too-large]
+The record Slurm returned for a job is larger than this DVM will read, so
+the request that needed it cannot be served.
+
+  Job:             %s
+  Limit reached:   %lu bytes
+  Nodes expected:  %d
+  Allowed per node: %lu bytes
+
+"scontrol show job --json" prints every socket and every core of every
+allocated node, so a job's record grows with the total core count of the
+nodes it holds, whether or not the job uses them. The limit above is
+derived from the nodes this job was expected to hold and the
+ras_slurm_job_info_bytes_per_node MCA parameter.
+
+Raise that parameter if this cluster's nodes are larger than it assumes:
+
+  --prtemca ras_slurm_job_info_bytes_per_node <bytes>
+
+Setting it to 0 removes the limit entirely.
