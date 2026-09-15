@@ -54,3 +54,21 @@ Similar to the ``salloc`` case, no command line options specifying
 number of processes were necessary, since PRRTE will obtain
 that information directly from Slurm at run time.
 
+
+Tuning
+------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 15 45
+
+   * - Parameter
+     - Default
+     - Meaning
+   * - ``ras_slurm_job_info_bytes_per_node``
+     - ``131072`` (128 KiB)
+     - Bytes of ``scontrol show job --json`` output to allow per node in the
+       job being read, on top of a 1MB base.  Slurm prints every socket and
+       every core of every allocated node, so a job's record grows with the
+       total core count of the nodes it holds.  Raise it where nodes are
+       larger than the default assumes; ``0`` removes the limit.

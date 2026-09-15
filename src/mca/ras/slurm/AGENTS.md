@@ -19,7 +19,7 @@ Files:
 
 | File | Contents |
 |------|----------|
-| `ras_slurm_component.c` | Registration; `query` gates on `SLURM_JOBID`; many `propagate_*` MCA params. |
+| `ras_slurm_component.c` | Registration; `query` gates on `SLURM_JOBID`; many `propagate_*` MCA params, plus `job_info_bytes_per_node`. |
 | `ras_slurm_module.c` | `init`, `allocate`, `modify`, `finalize`; the `SLURM_NODELIST` regex parser; session/tagging helpers; jobid/hostname validation. |
 | `ras_slurm_modify_extend.c` | `PMIX_ALLOC_EXTEND`/`PMIX_ALLOC_NEW`: vet the request, build & launch a `salloc --no-shell` expander job, wait for it, trim its time limit, absorb new nodes. |
 | `ras_slurm_modify_release.c` | `PMIX_ALLOC_RELEASE`: `scontrol update job` to shrink; remove nodes by count. |
@@ -92,6 +92,17 @@ deviation* and the framework guide.
   protecting the node the HNP is running on.
 - **`PMIX_ALLOC_REQ_CANCEL`** → `serve_cancel_req`: cancels a pending
   extend by request id, and answers it (see below).
+
+### One read of each job per grow
+
+A job's JSON record grows with the total core count of the nodes it holds, so
+the read budget is `1MB + ras_slurm_job_info_bytes_per_node * nodes` and a
+refusal names both. A grow reads the parent record once (`extract_job_fields`,
+which also reports its window) and the expander record once per poll
+(`check_resources`, which also reports its window) plus once for the nodes
+(`add_modified_resources`). The re-fetches those folds replaced were removed
+deliberately; `trim_job_to_parent`'s second read of the *parent* is not one of
+them and must stay, for the reason given below.
 
 ### `PMIX_ALLOC_NEW` is a synonym for `PMIX_ALLOC_EXTEND`
 
