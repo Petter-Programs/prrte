@@ -272,35 +272,54 @@ static int prte_ras_slurm_get_jobinfo_json(const char *slurm_jobid, json_t **job
         goto cleanup;
     }
 
-    if (!WIFEXITED(status) || 0 != WEXITSTATUS(status)) {
+    /* Our own limits before the exit status: a short read leaves scontrol
+     * writing into a closed pipe, so it dies on SIGPIPE and the checks below
+     * would blame the scheduler.  Only when nothing parsed, since a record
+     * ending exactly on the budget is complete. */
+    if (NULL == parent_json) {
+        if (lr.truncated) {
+            err = PRTE_ERR_MEM_LIMIT_EXCEEDED;
+            PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
+                "%s ras:slurm:get_jobinfo_json: job info JSON was truncated.",
+                PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
+            PRTE_ERROR_LOG(err);
+            goto cleanup;
+        }
+
+        if (lr.io_error) {
+            err = PRTE_ERR_FILE_READ_FAILURE;
+            PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
+                "%s ras:slurm:get_jobinfo_json: error reading from stream.",
+                PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
+            PRTE_ERROR_LOG(err);
+            goto cleanup;
+        }
+    }
+
+    if (!WIFEXITED(status)) {
         PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
-            "%s ras:slurm:get_jobinfo_json: non-zero exit code (%d) from scontrol command.",
+            "%s ras:slurm:get_jobinfo_json: scontrol command died on signal %d.",
             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-            WIFEXITED(status) ? WEXITSTATUS(status) : -1));
+            WIFSIGNALED(status) ? WTERMSIG(status) : 0));
         err = PRTE_ERR_SLURM_QUERY_FAILURE;
         PRTE_ERROR_LOG(err);
         goto cleanup;
     }
 
-    if(!parent_json) {
+    if (0 != WEXITSTATUS(status)) {
+        PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
+            "%s ras:slurm:get_jobinfo_json: non-zero exit code (%d) from scontrol command.",
+            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), WEXITSTATUS(status)));
+        err = PRTE_ERR_SLURM_QUERY_FAILURE;
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
+    }
 
-        if(lr.io_error) {
-            err = PRTE_ERR_FILE_READ_FAILURE;
-            PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
-            "%s ras:slurm:get_jobinfo_json: error reading from stream.",
-            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
-        } else if(lr.truncated) {
-            err = PRTE_ERR_MEM_LIMIT_EXCEEDED;
-            PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
-            "%s ras:slurm:get_jobinfo_json: job info JSON was truncated.",
-            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
-        } else {
-            err = PRTE_ERR_JSON_PARSE_FAILURE;
-            PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
+    if (NULL == parent_json) {
+        err = PRTE_ERR_JSON_PARSE_FAILURE;
+        PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
             "%s ras:slurm:get_jobinfo_json: job info JSON parse failed.",
             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
-        }
-
         PRTE_ERROR_LOG(err);
         goto cleanup;
     }
