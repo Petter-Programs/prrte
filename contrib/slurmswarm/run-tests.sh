@@ -1015,6 +1015,7 @@ test_elastic() {
     # up a DVM of its own.
     elastic_argv_group
     elastic_fault_group
+    elastic_oversize_group
 }
 
 # The first extend, and everything that can only be asserted about a grant
@@ -1657,6 +1658,89 @@ elastic_argv_group() {
     DVM_SHIM=0
     cleanup_cluster
 }
+
+# A record that is valid and merely too large.  The size limit is derived from
+# the nodes a job is expected to hold, so it is the one refusal an operator is
+# meant to be able to lift -- which makes both halves worth pinning: that a
+# record over the budget is refused with the numbers named, and that raising
+# the parameter accepts the same record.
+elastic_oversize_group() {
+    local out fat
+
+    banner "ras/slurm: an oversized scheduler record is refused, and the limit lifts it"
+    cleanup_cluster
+    if ! ON 1 "test -x $SHIM_BIN/slurm-shim"; then
+        skp "the recording shim is not in the volume -- rerun ./build.sh"
+        return
+    fi
+    SHIM reset >/dev/null 2>&1
+    ALLOC new --tag dvm --nodes 2 --tasks-per-node 2 >/dev/null 2>&1
+    DVM_SHIM=1
+
+    # Well over the 1MB base the budget starts from, so a 1-node expander is
+    # refused no matter how the per-node term rounds.
+    fat=4000000
+
+    if ! dvm_start --prtemca prte_elastic_mode 1; then
+        DVM_SHIM=0
+        bad "no DVM came up under the recording shim"
+        skp "the oversize-record cases need a DVM"
+        cleanup_cluster
+        return
+    fi
+
+    SHIM set fat_json "$fat" >/dev/null 2>&1
+    out=$(SA 'timeout 120 elastic extend 1' 2>&1)
+    SHIM set fat_json 0 >/dev/null 2>&1
+
+    echo "$out" | grep -q 'REJECTED' \
+        && ok "an extend on an oversized record was refused" \
+        || bad "an oversized record was not refused: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+
+    # A caller that can only print PMIx_Error_string must get something
+    # better than "ERROR".
+    echo "$out" | grep -q 'REJECTED: ERROR' \
+        && bad "the refusal still reaches the caller as a bare PMIX_ERROR" \
+        || ok "the refusal names a status other than PMIX_ERROR"
+
+    # Diagnosable without a debugger: the message has to carry the limit and
+    # the parameter that raises it.  Assertable only because dvm_start runs
+    # the HNP in the foreground.
+    seg=$(SA "awk '/larger than this DVM will read/,0' /tmp/prte.out")
+    echo "$seg" | grep -q 'ras_slurm_job_info_bytes_per_node' \
+        && ok "the refusal names the parameter that raises the limit" \
+        || bad "the refusal did not name the parameter: $(SA 'tail -5 /tmp/prte.out' | tr '\n' ' ')"
+    echo "$seg" | grep -q 'Nodes expected' \
+        && ok "the refusal names what the limit was derived from" \
+        || bad "the refusal did not name the node count it derived from"
+
+    SA 'pgrep -x prte >/dev/null' && ok "HNP survived the oversized record" \
+                                  || bad "HNP died on an oversized record"
+    drop_extra_jobs "$(ALLOC jobid --tag dvm | tr -d ' \r')"
+    dvm_stop
+
+    # Same record, same fault, a budget that admits it.  Without this the
+    # parameter is never shown to do anything.
+    if ! dvm_start --prtemca prte_elastic_mode 1 \
+                   --prtemca ras_slurm_job_info_bytes_per_node $((fat * 2)); then
+        DVM_SHIM=0
+        bad "no DVM came up with a raised job-info limit"
+        cleanup_cluster
+        return
+    fi
+    SHIM set fat_json "$fat" >/dev/null 2>&1
+    out=$(SA 'timeout 180 elastic extend 1' 2>&1)
+    SHIM set fat_json 0 >/dev/null 2>&1
+    echo "$out" | grep -q 'ALLOC_ID' \
+        && ok "raising the limit accepted the same record" \
+        || bad "the raised limit did not accept the record: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+    drop_extra_jobs "$(ALLOC jobid --tag dvm | tr -d ' \r')"
+
+    dvm_stop
+    DVM_SHIM=0
+    cleanup_cluster
+}
+
 
 # What PRRTE does when the scheduler misbehaves.
 #

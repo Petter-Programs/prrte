@@ -687,6 +687,7 @@ slurm-shim argv                  # argv of the most recent salloc
 slurm-shim audit                 # every wrapped command, in order
 slurm-shim set bad_json 1        # scontrol --json prints garbage, exits 0
 slurm-shim set scancel_fail 1    # scancel fails, verbosely
+slurm-shim set fat_json 4000000  # scontrol --json pads its record to n bytes
 ```
 
 Three properties of it are deliberate:
@@ -702,6 +703,13 @@ Three properties of it are deliberate:
   exactly one extend.
 - **`bad_json` exits 0.** A non-zero status would be caught by the caller's
   status check and never reach the parser, which is the code under test.
+- **`fat_json` forks where the others `exec`.** It pads the scheduler's own
+  record, so that record has to come back to it; safe for `scontrol`, which
+  PRRTE reads through `popen` and does not track by pid. The padding is a new
+  key, because PRRTE parses with `JSON_REJECT_DUPLICATES` and repeating an
+  existing one would be refused as malformed, proving nothing about size.
+  Every field PRRTE reads is left as the scheduler wrote it, so size is the
+  only variable — which is what `bad_json` cannot isolate.
 
 Fault flags are armed one at a time and cleared by the case that armed them;
 `DVM_SHIM` is put back to 0 after each group, or every later phase would be

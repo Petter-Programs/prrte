@@ -44,8 +44,12 @@
 #   bad_json 1     `scontrol show job ... --json` prints garbage, exits 0
 #   scancel_fail 1 `scancel` fails with far more output than PRRTE's capture
 #                  buffer holds, so the truncation path is taken
+#   fat_json <n>   `scontrol show job ... --json` prints the real record padded
+#                  out to at least n bytes, still valid JSON
 
+import json
 import os
+import subprocess
 import sys
 
 STATE = os.environ.get("SLURM_SHIM_STATE", "/tmp/slurm-shim")
@@ -132,6 +136,39 @@ def main():
         # caught by the caller's status check and never reach the parser,
         # which is the code under test.
         sys.stdout.write("{ this is not json, and never was\n")
+        return 0
+
+    if "scontrol" == name and "--json" in argv and flag("fat_json") not in (None, "", "0"):
+        # The one case bad_json cannot cover: a record that is entirely valid
+        # and merely too big, so the size limit is the only thing under test.
+        # Every field PRRTE reads is the scheduler's own.
+        #
+        # Forks where the other faults exec, because the real output has to
+        # come back here to be padded.  Safe for scontrol, which PRRTE reads
+        # through popen and does not track by pid.
+        real = real_command(name)
+        if real is None:
+            sys.stderr.write("slurm-shim: no real %s on PATH\n" % name)
+            return 127
+        out = subprocess.run([real] + argv, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, universal_newlines=True)
+        if 0 != out.returncode:
+            sys.stdout.write(out.stdout)
+            sys.stderr.write(out.stderr)
+            return out.returncode
+        try:
+            doc = json.loads(out.stdout)
+        except ValueError:
+            sys.stdout.write(out.stdout)
+            return 0
+        # A NEW key: PRRTE parses with JSON_REJECT_DUPLICATES, so padding by
+        # repeating an existing one would be refused as malformed and prove
+        # nothing about size.
+        want = int(flag("fat_json"))
+        doc["prte_shim_padding"] = ""
+        pad = want - len(json.dumps(doc))
+        doc["prte_shim_padding"] = "x" * max(pad, 0)
+        sys.stdout.write(json.dumps(doc))
         return 0
 
     if "scancel" == name and "1" == flag("scancel_fail"):
