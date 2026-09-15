@@ -60,10 +60,12 @@ bool prte_ras_slurm_have_extensions(bool quiet);
 
 /* Features requiring JSON parser */
 int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table);
-int prte_ras_slurm_add_modified_resources(const char *slurm_jobid, pmix_list_t *node_list);
+int prte_ras_slurm_add_modified_resources(const char *slurm_jobid, int expected_nodes,
+                                          pmix_list_t *node_list);
 int prte_ras_slurm_detach_nodes(const char *slurm_jobid, prte_session_t *session, pmix_pointer_array_t *removed_nodes);
-int prte_ras_slurm_check_resources(const char *slurm_jobid);
-int prte_ras_slurm_get_job_times(const char *slurm_jobid, time_t *start_time, time_t *end_time);
+int prte_ras_slurm_check_resources(const char *slurm_jobid, int expected_nodes);
+int prte_ras_slurm_get_job_times(const char *slurm_jobid, int expected_nodes,
+                                 time_t *start_time, time_t *end_time);
 
 /* Features to serve cancel requests */
 int prte_ras_slurm_add_pending_req(const char *request_id, const char *slurm_job_id);
@@ -98,6 +100,7 @@ int prte_ras_slurm_convert_jobid(const char *slurm_jobid, uint32_t *slurm_jobid_
 int prte_ras_slurm_assign_new_session(const char *slurm_jobid, const char *user_refid,
                                       pmix_list_t *node_list, bool dynamic);
 int prte_ras_slurm_tag_node_allocation(const char *slurm_jobid, pmix_list_t *node_list);
+int prte_ras_slurm_session_node_count(const char *slurm_jobid, int *num_nodes);
 
 typedef struct {
     prte_ras_base_component_t super;
@@ -111,6 +114,7 @@ typedef struct {
     bool propagate_mem_per_node;
     bool propagate_time;
     bool propagate_threads_per_core;
+    size_t job_info_bytes_per_node;
 } prte_mca_ras_slurm_component_t;
 PRTE_EXPORT extern prte_mca_ras_slurm_component_t prte_mca_ras_slurm_component;
 

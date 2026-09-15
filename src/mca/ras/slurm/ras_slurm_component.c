@@ -134,6 +134,16 @@ static int ras_slurm_register(void)
                                                 PMIX_MCA_BASE_VAR_TYPE_BOOL,
                                                 &prte_mca_ras_slurm_component.propagate_threads_per_core);
 
+    /* Slurm prints every socket and every core of every allocated node, so a
+     * node's cost follows its core count rather than what the job uses.  On
+     * 24.11 a node declared "CPUs=112" with no topology - which Slurm models
+     * as 112 sockets of one core - measured ~34KB.  The default is ~4x that,
+     * for fatter nodes and a schema that gains fields. */
+    prte_mca_ras_slurm_component.job_info_bytes_per_node = 128 * 1024;
+    (void) pmix_mca_base_component_var_register(component, "job_info_bytes_per_node",
+                                                "Bytes of \"scontrol show job --json\" output to allow per node in the job being read, on top of a 1MB base (0 disables the limit)",
+                                                PMIX_MCA_BASE_VAR_TYPE_SIZE_T,
+                                                &prte_mca_ras_slurm_component.job_info_bytes_per_node);
 
     return PRTE_SUCCESS;
 }

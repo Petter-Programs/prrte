@@ -22,6 +22,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <limits.h>
+#include <stdint.h>
 #include <sys/wait.h>
 
 #if PRTE_TESTBUILD_LAUNCHERS
@@ -38,7 +39,10 @@
 #include "ras_slurm.h"
 #include "src/mca/common/slurm/common_slurm.h"
 
-#define PRTE_SLURM_JOB_INFO_MAX_SIZE (1 * 1024 * 1024)
+/* The record costs a fixed part plus a per-node part.  This covers the fixed
+ * part: on Slurm 24, ~10KB measured and a ceiling near 200KB from its
+ * per-field length limits. */
+#define PRTE_SLURM_JOB_INFO_BASE_SIZE (1024 * 1024)
 #define PRTE_SLURM_MAX_THREADS_PER_CORE 32
 #define PRTE_SLURM_MAX_CORE_COUNT 4096
 
@@ -47,8 +51,10 @@
  */
 static int prte_ras_slurm_get_json_numobj_field(json_t *job, const char *key, pmix_hash_table_t *values_table);
 static int prte_ras_slurm_get_json_numobj_value(json_t *job, const char *key, int64_t *out);
-static int prte_ras_slurm_get_jobinfo_json(const char *slurm_jobid, json_t **job_info_out);
+static int prte_ras_slurm_get_jobinfo_json(const char *slurm_jobid, int expected_nodes,
+                                           json_t **job_info_out);
 static size_t prte_ras_slurm_jansson_cbfunc(void *buffer, size_t buflen, void *data);
+static size_t prte_ras_slurm_job_info_budget(int expected_nodes);
 
 /* Bounded reader for Slurm JSON output */
 typedef struct {
@@ -192,6 +198,38 @@ static size_t prte_ras_slurm_jansson_cbfunc(void *buffer, size_t buflen, void *d
 }
 
 /*
+ * How much "scontrol show job --json" output to accept for a job of this size.
+ *
+ * Slurm prints every socket and every core of every allocated node, so the
+ * record grows with the job's node count and a fixed limit is either too small
+ * for a large job or no limit at all for a small one.
+ *
+ * @param[in] expected_nodes Nodes the job being read is expected to hold.
+ *
+ * @return Byte budget, or 0 when the caller has disabled the limit.
+ */
+static size_t prte_ras_slurm_job_info_budget(int expected_nodes)
+{
+    size_t per_node = prte_mca_ras_slurm_component.job_info_bytes_per_node;
+
+    if (0 == per_node) {
+        return 0;
+    }
+
+    if (0 >= expected_nodes) {
+        expected_nodes = 1;
+    }
+
+    /* A count large enough to overflow the budget is not one we could serve
+     * anyway, so treat it as unbounded instead of wrapping into a tiny one. */
+    if ((size_t) expected_nodes > (SIZE_MAX - PRTE_SLURM_JOB_INFO_BASE_SIZE) / per_node) {
+        return 0;
+    }
+
+    return PRTE_SLURM_JOB_INFO_BASE_SIZE + (per_node * (size_t) expected_nodes);
+}
+
+/*
  * Query Slurm job information and return the job object as Jansson JSON.
  *
  * Executes `scontrol show job <jobid> --json`, parses the resulting JSON,
@@ -201,11 +239,14 @@ static size_t prte_ras_slurm_jansson_cbfunc(void *buffer, size_t buflen, void *d
  *
  * @param[in] slurm_jobid
  *     SLURM job ID to query.
+ * @param[in] expected_nodes
+ *     Nodes this job is expected to hold, which sizes the read budget.
  * @param[out] job_info_out
  *     Output pointer receiving the parsed JSON object for the job. Set to
  *     NULL on entry and on failure.
  */
-static int prte_ras_slurm_get_jobinfo_json(const char *slurm_jobid, json_t **job_info_out)
+static int prte_ras_slurm_get_jobinfo_json(const char *slurm_jobid, int expected_nodes,
+                                           json_t **job_info_out)
 {
     if(NULL == slurm_jobid || NULL == job_info_out) {
         PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
@@ -248,9 +289,11 @@ static int prte_ras_slurm_get_jobinfo_json(const char *slurm_jobid, json_t **job
         goto cleanup;
     }
 
+    size_t budget = prte_ras_slurm_job_info_budget(expected_nodes);
+
     jansson_limited_reader_t lr = {
         .fp = fp,
-        .remaining = PRTE_SLURM_JOB_INFO_MAX_SIZE,
+        .remaining = (0 == budget) ? SIZE_MAX : budget,
         .truncated = false,
         .io_error = false
     };
@@ -399,9 +442,16 @@ int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
         return PRTE_ERR_NOT_FOUND;
     }
 
+    int expected_nodes;
+    err = prte_ras_slurm_session_node_count(slurm_jobid, &expected_nodes);
+
+    if(PRTE_SUCCESS != err) {
+        return err;
+    }
+
     /* Read JSON from stream and extract the first and only job
        in the "jobs" array, taking ownership of the returned json. */
-    err = prte_ras_slurm_get_jobinfo_json(slurm_jobid, &job);
+    err = prte_ras_slurm_get_jobinfo_json(slurm_jobid, expected_nodes, &job);
 
     if(PRTE_SUCCESS != err) {
         goto cleanup;
@@ -501,9 +551,11 @@ int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
  * The resulting nodes are inserted into the provided node list.
  *
  * @param[in] slurm_jobid Slurm job ID.
+ * @param[in] expected_nodes Nodes this job is expected to hold.
  * @param[in,out] node_list. A pmix_list_t to add nodes to.
  */
-int prte_ras_slurm_add_modified_resources(const char *slurm_jobid, pmix_list_t *node_list)
+int prte_ras_slurm_add_modified_resources(const char *slurm_jobid, int expected_nodes,
+                                          pmix_list_t *node_list)
 {
     if(NULL == slurm_jobid || NULL == node_list) {
         PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
@@ -532,7 +584,7 @@ int prte_ras_slurm_add_modified_resources(const char *slurm_jobid, pmix_list_t *
 
     json_t *root = NULL;
 
-    err = prte_ras_slurm_get_jobinfo_json(slurm_jobid, &root);
+    err = prte_ras_slurm_get_jobinfo_json(slurm_jobid, expected_nodes, &root);
 
     if(PRTE_SUCCESS != err) {
         goto cleanup;
@@ -842,7 +894,14 @@ int prte_ras_slurm_detach_nodes(const char *slurm_jobid, prte_session_t *session
 
     json_t *root = NULL;
 
-    err = prte_ras_slurm_get_jobinfo_json(slurm_jobid, &root);
+    int expected_nodes;
+    err = prte_ras_slurm_session_node_count(slurm_jobid, &expected_nodes);
+
+    if(PRTE_SUCCESS != err) {
+        goto cleanup;
+    }
+
+    err = prte_ras_slurm_get_jobinfo_json(slurm_jobid, expected_nodes, &root);
 
     if(PRTE_SUCCESS != err) {
         goto cleanup;
@@ -991,8 +1050,9 @@ cleanup:
  * if the job reaches RUNNING.
  *
  * @param[in] slurm_jobid SLURM job ID to monitor.
+ * @param[in] expected_nodes Nodes this job is expected to hold.
  */
-int prte_ras_slurm_check_resources(const char *slurm_jobid)
+int prte_ras_slurm_check_resources(const char *slurm_jobid, int expected_nodes)
 {
     int err = PRTE_SUCCESS;
 
@@ -1008,7 +1068,7 @@ int prte_ras_slurm_check_resources(const char *slurm_jobid)
     bool pending = false;
     bool cancelled = false;
 
-    err = prte_ras_slurm_get_jobinfo_json(slurm_jobid, &job_info);
+    err = prte_ras_slurm_get_jobinfo_json(slurm_jobid, expected_nodes, &job_info);
 
     if(PRTE_SUCCESS != err) {
         goto cleanup;
@@ -1144,10 +1204,12 @@ static int prte_ras_slurm_get_json_numobj_value(json_t *job, const char *key, in
  * this allocation end" only once the job is running.
  *
  * @param[in]  slurm_jobid Slurm job ID to query.
+ * @param[in]  expected_nodes Nodes this job is expected to hold.
  * @param[out] start_time  Job start time, or 0.
  * @param[out] end_time    Job end time, or 0 if it has none.
  */
-int prte_ras_slurm_get_job_times(const char *slurm_jobid, time_t *start_time, time_t *end_time)
+int prte_ras_slurm_get_job_times(const char *slurm_jobid, int expected_nodes,
+                                 time_t *start_time, time_t *end_time)
 {
     int err = PRTE_SUCCESS;
     json_t *job_info = NULL;
@@ -1160,7 +1222,7 @@ int prte_ras_slurm_get_job_times(const char *slurm_jobid, time_t *start_time, ti
         return PRTE_ERR_BAD_PARAM;
     }
 
-    err = prte_ras_slurm_get_jobinfo_json(slurm_jobid, &job_info);
+    err = prte_ras_slurm_get_jobinfo_json(slurm_jobid, expected_nodes, &job_info);
 
     if (PRTE_SUCCESS != err) {
         return err;

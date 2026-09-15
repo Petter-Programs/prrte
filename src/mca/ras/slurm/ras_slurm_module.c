@@ -1020,3 +1020,42 @@ int prte_ras_slurm_tag_node_allocation(const char *slurm_jobid, pmix_list_t *nod
 
     return err;
 }
+
+/*
+ * Count the nodes the DVM holds under a Slurm job
+ *
+ * @param[in] slurm_jobid  Slurm job ID string
+ * @param[out] num_nodes   Receives the count
+ */
+int prte_ras_slurm_session_node_count(const char *slurm_jobid, int *num_nodes)
+{
+    pmix_pointer_array_t *nodes = NULL;
+    int count = 0;
+    int err;
+    int i;
+
+    if (NULL == slurm_jobid || NULL == num_nodes) {
+        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    err = prte_get_allocated_nodes(slurm_jobid, &nodes);
+    if (PRTE_SUCCESS != err) {
+        PRTE_ERROR_LOG(err);
+        return err;
+    }
+
+    if (NULL == nodes) {
+        PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
+        return PRTE_ERR_NOT_FOUND;
+    }
+
+    for (i = 0; i < nodes->size; i++) {
+        if (NULL != pmix_pointer_array_get_item(nodes, i)) {
+            count++;
+        }
+    }
+
+    *num_nodes = count;
+    return PRTE_SUCCESS;
+}

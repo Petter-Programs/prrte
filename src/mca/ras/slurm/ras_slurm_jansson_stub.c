@@ -37,10 +37,10 @@ int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
 /**
  * Add new SLURM job resources; returns PRTE_ERR_NOT_AVAILABLE if built without Jansson.
  */
-int prte_ras_slurm_add_modified_resources(const char *slurm_jobid,
+int prte_ras_slurm_add_modified_resources(const char *slurm_jobid, int expected_nodes,
                                                  pmix_list_t *node_list)
 {
-    PRTE_HIDE_UNUSED_PARAMS(slurm_jobid, node_list);
+    PRTE_HIDE_UNUSED_PARAMS(slurm_jobid, expected_nodes, node_list);
 
     pmix_output(0, "ras:slurm:add_modified_resources: "
                 "Jansson support is required but not enabled in this build");
@@ -59,9 +59,9 @@ int prte_ras_slurm_detach_nodes(const char *slurm_jobid, prte_session_t *session
 /**
  * Wait for SLURM job resources; returns PRTE_ERR_NOT_AVAILABLE if built without Jansson.
  */
-int prte_ras_slurm_check_resources(const char *slurm_jobid)
+int prte_ras_slurm_check_resources(const char *slurm_jobid, int expected_nodes)
 {
-    PRTE_HIDE_UNUSED_PARAMS(slurm_jobid);
+    PRTE_HIDE_UNUSED_PARAMS(slurm_jobid, expected_nodes);
     pmix_output(0, "ras:slurm:wait_resources: "
                 "Jansson support is required but not enabled in this build");
     return PRTE_ERR_NOT_AVAILABLE;
@@ -70,9 +70,10 @@ int prte_ras_slurm_check_resources(const char *slurm_jobid)
 /**
  * Read a job's start/end times; returns PRTE_ERR_NOT_AVAILABLE if built without Jansson.
  */
-int prte_ras_slurm_get_job_times(const char *slurm_jobid, time_t *start_time, time_t *end_time)
+int prte_ras_slurm_get_job_times(const char *slurm_jobid, int expected_nodes,
+                                 time_t *start_time, time_t *end_time)
 {
-    PRTE_HIDE_UNUSED_PARAMS(slurm_jobid, start_time, end_time);
+    PRTE_HIDE_UNUSED_PARAMS(slurm_jobid, expected_nodes, start_time, end_time);
     pmix_output(0, "ras:slurm:get_job_times: "
                 "Jansson support is required but not enabled in this build");
     return PRTE_ERR_NOT_AVAILABLE;

@@ -15,6 +15,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <signal.h>
 #include <string.h>
@@ -67,6 +68,7 @@ typedef struct {
     char *request_id;
     bool user_request_id_provided;
     char *job_id;
+    int num_nodes;
     int err;
     uint64_t retry_delay_usec;
     int attempts;
@@ -116,7 +118,7 @@ static int prte_ras_slurm_add_reused_nodes_to_session(const char *slurm_jobid,
 static void prte_ras_slurm_rollback_session(const char *slurm_jobid);
 static int prte_ras_slurm_vet_node_list(char **names, uint64_t *count);
 static int prte_ras_slurm_limit_to_parent_remainder(pmix_hash_table_t *fields);
-static int prte_ras_slurm_trim_job_to_parent(const char *slurm_jobid);
+static int prte_ras_slurm_trim_job_to_parent(const char *slurm_jobid, int num_nodes);
 static void prte_ras_slurm_extend_wait_complete(int fd, short args, void *cbdata);
 static void slurm_grant_check_cb(int fd, short args, void *cbdata);
 static prte_slurm_wait_tracker_t *prte_ras_slurm_tracker_for_child(const prte_slurm_salloc_child_t *child);
@@ -184,6 +186,7 @@ static void swt_con(prte_slurm_wait_tracker_t *p)
     p->attempts = 0;
     p->tracker_index = -1;
     p->completing = false;
+    p->num_nodes = 0;
 }
 
 /*
@@ -1240,6 +1243,7 @@ static int prte_ras_slurm_limit_to_parent_remainder(pmix_hash_table_t *fields)
     void *old_value = NULL;
     time_t parent_end = 0;
     long minutes;
+    int parent_nodes;
     int err;
     int pmix_err;
 
@@ -1248,7 +1252,12 @@ static int prte_ras_slurm_limit_to_parent_remainder(pmix_hash_table_t *fields)
         return PRTE_ERR_NOT_FOUND;
     }
 
-    err = prte_ras_slurm_get_job_times(parent_jobid, NULL, &parent_end);
+    err = prte_ras_slurm_session_node_count(parent_jobid, &parent_nodes);
+    if (PRTE_SUCCESS != err) {
+        return err;
+    }
+
+    err = prte_ras_slurm_get_job_times(parent_jobid, parent_nodes, NULL, &parent_end);
     if (PRTE_SUCCESS != err) {
         return err;
     }
@@ -1304,7 +1313,7 @@ static int prte_ras_slurm_limit_to_parent_remainder(pmix_hash_table_t *fields)
  *
  * @param[in] slurm_jobid Slurm job ID of the running expander job.
  */
-static int prte_ras_slurm_trim_job_to_parent(const char *slurm_jobid)
+static int prte_ras_slurm_trim_job_to_parent(const char *slurm_jobid, int num_nodes)
 {
     int err = PRTE_SUCCESS;
     char *parent_jobid = NULL;
@@ -1314,6 +1323,7 @@ static int prte_ras_slurm_trim_job_to_parent(const char *slurm_jobid)
     time_t start = 0;
     time_t end = 0;
     long minutes;
+    int parent_nodes;
     static const char *cmd_format = "scontrol update job %s TimeLimit=%ld 2>&1";
     char err_msg[PRTE_SLURM_ERR_STR_MAX_LEN + 1];
 
@@ -1333,7 +1343,7 @@ static int prte_ras_slurm_trim_job_to_parent(const char *slurm_jobid)
         return PRTE_ERR_NOT_FOUND;
     }
 
-    err = prte_ras_slurm_get_job_times(slurm_jobid, &start, &end);
+    err = prte_ras_slurm_get_job_times(slurm_jobid, num_nodes, &start, &end);
     if (PRTE_SUCCESS != err) {
         return err;
     }
@@ -1347,9 +1357,14 @@ static int prte_ras_slurm_trim_job_to_parent(const char *slurm_jobid)
         return PRTE_ERR_NOT_FOUND;
     }
 
+    err = prte_ras_slurm_session_node_count(parent_jobid, &parent_nodes);
+    if (PRTE_SUCCESS != err) {
+        return err;
+    }
+
     /* Read the parent last: nothing re-trims afterwards, so a parent shortened
      * between the two queries must land on this side of the arithmetic. */
-    err = prte_ras_slurm_get_job_times(parent_jobid, NULL, &parent_end);
+    err = prte_ras_slurm_get_job_times(parent_jobid, parent_nodes, NULL, &parent_end);
     if (PRTE_SUCCESS != err) {
         return err;
     }
@@ -1477,7 +1492,7 @@ static void prte_ras_slurm_extend_wait_complete(int fd, short args, void *cbdata
      * failed trim is not fatal: the nodes are granted and usable, and the job
      * is scancelled with its session either way. */
     if (prte_mca_ras_slurm_component.propagate_time) {
-        int trim_err = prte_ras_slurm_trim_job_to_parent(job_id);
+        int trim_err = prte_ras_slurm_trim_job_to_parent(job_id, trk->num_nodes);
 
         if (PRTE_SUCCESS != trim_err) {
             pmix_output(0, "ras:slurm:modify: could not align job %s with the end of"
@@ -1491,7 +1506,7 @@ static void prte_ras_slurm_extend_wait_complete(int fd, short args, void *cbdata
     PMIX_CONSTRUCT(&reused_nodes, pmix_pointer_array_t);
     have_reused_nodes = true;
 
-    err = prte_ras_slurm_add_modified_resources(job_id, &added_nodes);
+    err = prte_ras_slurm_add_modified_resources(job_id, trk->num_nodes, &added_nodes);
 
     if(PRTE_SUCCESS != err) {
         goto complete;
@@ -1667,7 +1682,7 @@ static void slurm_grant_check_cb(int fd, short args, void *cbdata)
 
     int err;
 
-    err = prte_ras_slurm_check_resources(trk->job_id);
+    err = prte_ras_slurm_check_resources(trk->job_id, trk->num_nodes);
 
     if (PRTE_ERR_RESOURCE_BUSY == err && PRTE_SLURM_GRANT_RETRY_MAX > trk->attempts) {
 
@@ -1839,6 +1854,15 @@ int prte_ras_slurm_serve_extend_req(prte_pmix_server_req_t *req)
         err = PRTE_ERR_REQUEST;
         goto cleanup;
     }
+
+    /* A count PRRTE cannot hold in the int its node bookkeeping uses. */
+    if (num_nodes > (uint64_t) INT_MAX) {
+        pmix_output(0, "ras:slurm:modify: a grow asked for %" PRIu64 " nodes;"
+                       " the most that can be requested is %d.",
+                    num_nodes, INT_MAX);
+        err = PRTE_ERR_BAD_PARAM;
+        goto cleanup;
+    }
     
     PMIX_CONSTRUCT(&slurm_jobfields, pmix_hash_table_t);
 
@@ -1959,6 +1983,8 @@ int prte_ras_slurm_serve_extend_req(prte_pmix_server_req_t *req)
 
     trk->req = req;
     PMIX_RETAIN(req);
+
+    trk->num_nodes = (int) num_nodes;
 
     trk->request_id = strdup(request_id);
 
