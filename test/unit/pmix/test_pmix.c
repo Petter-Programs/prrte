@@ -381,6 +381,13 @@ static int test_status_known_collisions(void)
     CHECK("no-permissions comes back as a permission failure",
           PRTE_ERR_PERM == prte_pmix_convert_status(PMIX_ERR_NO_PERMISSIONS));
 
+    /* A refusal to read further is a resource the caller did not get, not
+     * the bare PMIX_ERROR every unmapped code falls through to. */
+    CHECK("a memory limit says a resource ran out",
+          PMIX_ERR_OUT_OF_RESOURCE == prte_pmix_convert_rc(PRTE_ERR_MEM_LIMIT_EXCEEDED));
+    CHECK("a memory limit is not a bare error",
+          PMIX_ERROR != prte_pmix_convert_rc(PRTE_ERR_MEM_LIMIT_EXCEEDED));
+
     return failures;
 }
 
