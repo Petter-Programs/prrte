@@ -6,6 +6,8 @@
  * Copyright (c) 2015-2020 Intel, Inc.  All rights reserved.
  *
  * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2026      Barcelona Supercomputing Center (BSC-CNS).
+ *                         All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -22,6 +24,7 @@
 #include "src/mca/state/state.h"
 #include "src/runtime/prte_globals.h"
 #include "src/prted/pmix/pmix_server_internal.h"
+#include "src/util/name_fns.h"
 #include "ras_pmix.h"
 
 /*
@@ -112,6 +115,7 @@ static int init(void)
     PMIX_INFO_LOAD(&dirs[n++], PMIX_CONNECT_RETRY_DELAY, &c->retry_delay, PMIX_UINT32);
 
     prte_pmix_set_scheduler_directives(dirs, ndirs);
+    prte_ras_pmix_alloc_init();
     return PRTE_SUCCESS;
 }
 
@@ -127,21 +131,201 @@ prte_ras_base_module_t prte_ras_pmix_module = {
     .init = init,
     .allocate = allocate,
     .modify = modify,
+    .shrink_complete = prte_ras_pmix_shrink_complete,
     .finalize = finalize
 };
 
-static int allocate(prte_job_t *jdata, pmix_list_t *nodes)
-{
-    PRTE_HIDE_UNUSED_PARAMS(jdata, nodes);
+/* A request we make to the scheduler ourselves, not on behalf of a client. */
+typedef struct {
+    pmix_object_t super;
+    prte_event_t ev;
+    prte_event_cbfunc_t handler;
+    prte_job_t *jdata;
+    char *alloc_id;
+    pmix_info_t *req;
+    size_t nreq;
+    pmix_status_t status;
+    pmix_info_t *info;
+    size_t ninfo;
+    pmix_release_cbfunc_t rel;
+    void *relcbdata;
+} prte_ras_pmix_own_t;
 
-    return PRTE_ERR_TAKE_NEXT_OPTION;
+static void owncon(prte_ras_pmix_own_t *p)
+{
+    p->handler = NULL;
+    p->jdata = NULL;
+    p->alloc_id = NULL;
+    p->req = NULL;
+    p->nreq = 0;
+    p->status = PMIX_SUCCESS;
+    p->info = NULL;
+    p->ninfo = 0;
+    p->rel = NULL;
+    p->relcbdata = NULL;
+}
+static void owndes(prte_ras_pmix_own_t *p)
+{
+    if (NULL != p->rel) {
+        p->rel(p->relcbdata);
+    }
+    if (NULL != p->req) {
+        PMIX_INFO_FREE(p->req, p->nreq);
+    }
+    if (NULL != p->jdata) {
+        PMIX_RELEASE(p->jdata);
+    }
+    free(p->alloc_id);
+}
+static PMIX_CLASS_INSTANCE(prte_ras_pmix_own_t, pmix_object_t, owncon, owndes);
+
+static void own_cbfunc(pmix_status_t status, pmix_info_t *info, size_t ninfo,
+                       void *cbdata, pmix_release_cbfunc_t rel, void *relcbdata)
+{
+    prte_ras_pmix_own_t *cd = (prte_ras_pmix_own_t *) cbdata;
+
+    cd->status = status;
+    cd->info = info;
+    cd->ninfo = ninfo;
+    cd->rel = rel;
+    cd->relcbdata = relcbdata;
+    PRTE_PMIX_THREADSHIFT(cd, prte_event_base, cd->handler);
 }
 
-/*
- * There's really nothing to do here
- */
+static void allocation_answered(int sd, short args, void *cbdata)
+{
+    prte_ras_pmix_own_t *cd = (prte_ras_pmix_own_t *) cbdata;
+    int rc;
+    PRTE_HIDE_UNUSED_PARAMS(sd, args);
+
+    PMIX_ACQUIRE_OBJECT(cd);
+    if (PMIX_SUCCESS != cd->status) {
+        pmix_output(0, "ras:pmix: the scheduler refused the DVM's allocation: %s",
+                    PMIx_Error_string(cd->status));
+        PRTE_ACTIVATE_JOB_STATE(cd->jdata, PRTE_JOB_STATE_ALLOC_FAILED);
+    } else {
+        rc = prte_ras_pmix_adopt_allocation(cd->jdata, cd->info, cd->ninfo);
+        if (PRTE_SUCCESS != rc) {
+            PRTE_ERROR_LOG(rc);
+            PRTE_ACTIVATE_JOB_STATE(cd->jdata, PRTE_JOB_STATE_ALLOC_FAILED);
+        }
+    }
+    PMIX_RELEASE(cd);
+}
+
+static void give_back_answered(int sd, short args, void *cbdata)
+{
+    prte_ras_pmix_own_t *cd = (prte_ras_pmix_own_t *) cbdata;
+    PRTE_HIDE_UNUSED_PARAMS(sd, args);
+
+    PMIX_ACQUIRE_OBJECT(cd);
+    if (PMIX_SUCCESS != cd->status && PMIX_OPERATION_SUCCEEDED != cd->status) {
+        pmix_output(0, "ras:pmix: the scheduler did not take back allocation %s: %s",
+                    cd->alloc_id, PMIx_Error_string(cd->status));
+    }
+    PMIX_RELEASE(cd);
+}
+
+static pmix_status_t own_request(pmix_alloc_directive_t directive, prte_ras_pmix_own_t *cd,
+                                 prte_event_cbfunc_t handler)
+{
+    pmix_status_t rc;
+
+    rc = prte_pmix_set_scheduler();
+    if (PMIX_SUCCESS != rc) {
+        return rc;
+    }
+    cd->handler = handler;
+    return PMIx_Allocation_request_nb(directive, cd->req, cd->nreq, own_cbfunc, cd);
+}
+
+/* Ask the scheduler for the DVM's allocation with a PMIX_ALLOC_NEW that names
+ * no resources. The answer carries PMIX_ALLOC_ID and a PMIX_ALLOC_NODE_LIST of
+ * host[:slots]. */
+static int allocate(prte_job_t *jdata, pmix_list_t *nodes)
+{
+    prte_ras_pmix_own_t *cd;
+    pmix_status_t rc;
+    PRTE_HIDE_UNUSED_PARAMS(nodes);
+
+    /* without a scheduler there is no allocation; don't fall back to the
+     * local node */
+    rc = prte_pmix_set_scheduler();
+    if (PMIX_SUCCESS != rc) {
+        pmix_output(0, "ras:pmix: cannot reach the scheduler to ask for the DVM's "
+                       "allocation: %s", PMIx_Error_string(rc));
+        return prte_pmix_convert_status(rc);
+    }
+
+    cd = PMIX_NEW(prte_ras_pmix_own_t);
+    if (NULL == cd) {
+        return PRTE_ERR_OUT_OF_RESOURCE;
+    }
+    PMIX_RETAIN(jdata);
+    cd->jdata = jdata;
+    cd->nreq = 1;
+    PMIX_INFO_CREATE(cd->req, cd->nreq);
+    if (NULL == cd->req) {
+        PMIX_RELEASE(cd);
+        return PRTE_ERR_OUT_OF_RESOURCE;
+    }
+    PMIX_INFO_LOAD(&cd->req[0], PMIX_REQUESTOR, PRTE_PROC_MY_NAME, PMIX_PROC);
+
+    rc = own_request(PMIX_ALLOC_NEW, cd, allocation_answered);
+    if (PMIX_SUCCESS != rc) {
+        pmix_output(0, "ras:pmix: cannot ask the scheduler for the DVM's allocation: %s",
+                    PMIx_Error_string(rc));
+        PMIX_RELEASE(cd);
+        return prte_pmix_convert_status(rc);
+    }
+    PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
+                         "%s ras:pmix: asked the scheduler for the DVM's allocation",
+                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
+    return PRTE_ERR_ALLOCATION_PENDING;
+}
+
+int prte_ras_pmix_give_back(const char *alloc_id, char **nodes)
+{
+    prte_ras_pmix_own_t *cd;
+    pmix_status_t rc;
+    char *list = NULL;
+    size_t n = 0;
+
+    cd = PMIX_NEW(prte_ras_pmix_own_t);
+    if (NULL == cd) {
+        return PRTE_ERR_OUT_OF_RESOURCE;
+    }
+    cd->alloc_id = strdup(alloc_id);
+    if (NULL != nodes && NULL != nodes[0]) {
+        list = PMIx_Argv_join(nodes, ',');
+    }
+    cd->nreq = (NULL == list) ? 2 : 3;
+    PMIX_INFO_CREATE(cd->req, cd->nreq);
+    if (NULL == cd->req || NULL == cd->alloc_id) {
+        free(list);
+        PMIX_RELEASE(cd);
+        return PRTE_ERR_OUT_OF_RESOURCE;
+    }
+    PMIX_INFO_LOAD(&cd->req[n++], PMIX_ALLOC_ID, alloc_id, PMIX_STRING);
+    if (NULL != list) {
+        PMIX_INFO_LOAD(&cd->req[n++], PMIX_ALLOC_NODE_LIST, list, PMIX_STRING);
+        free(list);
+    }
+    PMIX_INFO_LOAD(&cd->req[n++], PMIX_REQUESTOR, PRTE_PROC_MY_NAME, PMIX_PROC);
+
+    rc = own_request(PMIX_ALLOC_RELEASE, cd, give_back_answered);
+    if (PMIX_SUCCESS != rc) {
+        pmix_output(0, "ras:pmix: cannot hand allocation %s back to the scheduler: %s",
+                    alloc_id, PMIx_Error_string(rc));
+        PMIX_RELEASE(cd);
+        return prte_pmix_convert_status(rc);
+    }
+    return PRTE_SUCCESS;
+}
+
 static int finalize(void)
 {
+    prte_ras_pmix_alloc_finalize();
     return PRTE_SUCCESS;
 }
 
@@ -166,6 +350,7 @@ typedef struct {
     pmix_object_t super;
     prte_event_t ev;
     prte_pmix_server_req_t *req;
+    bool grow;
     pmix_status_t status;
     pmix_info_t *info;
     size_t ninfo;
@@ -176,6 +361,7 @@ typedef struct {
 static void rpcon(prte_ras_pmix_caddy_t *p)
 {
     p->req = NULL;
+    p->grow = false;
     p->status = PMIX_SUCCESS;
     p->info = NULL;
     p->ninfo = 0;
@@ -325,7 +511,11 @@ static void passthru(int sd, short args, void *cbdata)
 
     // if we met the request, then we need to process it
     if (PMIX_SUCCESS == req->pstatus) {
-        prte_ras_base_complete_request(req);
+        if (cd->grow) {
+            prte_ras_pmix_grow(req);
+        } else {
+            prte_ras_base_complete_request(req);
+        }
     }
 
     if (NULL != req->infocbfunc) {
@@ -369,7 +559,7 @@ static void infocbfunc(pmix_status_t status,
     PRTE_PMIX_THREADSHIFT(cd, prte_event_base, passthru);
 }
 
-static pmix_status_t modify(prte_pmix_server_req_t *req)
+static pmix_status_t forward(prte_pmix_server_req_t *req, bool grow)
 {
     prte_ras_pmix_caddy_t *cd;
     pmix_status_t rc;
@@ -433,6 +623,7 @@ static pmix_status_t modify(prte_pmix_server_req_t *req)
      * reclaimed out from under the shift */
     PMIX_RETAIN(req);
     cd->req = req;
+    cd->grow = grow;
 
     /* pass the request to the scheduler */
     rc = PMIx_Allocation_request_nb(req->allocdir, req->info, req->ninfo,
@@ -444,4 +635,23 @@ static pmix_status_t modify(prte_pmix_server_req_t *req)
     }
 
     return rc;
+}
+
+/* An EXTEND that does not name one of our reservations grows the DVM. A
+ * RELEASE of the scheduler's nodes is done here, and the scheduler is told
+ * once the daemons are gone. Anything else goes to the scheduler and then to
+ * the base, as before. */
+static pmix_status_t modify(prte_pmix_server_req_t *req)
+{
+    switch (req->allocdir) {
+    case PMIX_ALLOC_EXTEND:
+        return forward(req, !prte_ras_pmix_names_reservation(req));
+    case PMIX_ALLOC_RELEASE:
+        if (prte_ras_pmix_release_is_ours(req)) {
+            return prte_ras_pmix_serve_release(req);
+        }
+        return forward(req, false);
+    default:
+        return forward(req, false);
+    }
 }
