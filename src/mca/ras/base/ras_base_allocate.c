@@ -307,6 +307,8 @@ void prte_ras_base_display_cpus(prte_job_t *jdata, char *nodelist)
 }
 
 
+static void ras_base_allocation_found(prte_job_t *jdata, pmix_list_t *nodes);
+
 /*
  * Function for selecting one component from all those that are
  * available.
@@ -317,13 +319,7 @@ void prte_ras_base_allocate(int fd, short args, void *cbdata)
     int rc;
     prte_job_t *jdata;
     pmix_list_t nodes;
-    prte_node_t *node;
-    int32_t j;
-    pmix_status_t ret;
     prte_ras_base_selected_module_t *mod;
-    char *hosts;
-    char **hostlist;
-    char *ptr;
     PRTE_HIDE_UNUSED_PARAMS(fd, args);
 
     PMIX_ACQUIRE_OBJECT(caddy);
@@ -382,7 +378,7 @@ void prte_ras_base_allocate(int fd, short args, void *cbdata)
             break;
         }
         if (PRTE_ERR_ALLOCATION_PENDING == rc) {
-            /* an allocation request is underway, so just do nothing */
+            /* the module calls prte_ras_base_allocation_granted() later */
             PMIX_LIST_DESTRUCT(&nodes);
             PMIX_RELEASE(caddy);
             return;
@@ -402,16 +398,40 @@ void prte_ras_base_allocate(int fd, short args, void *cbdata)
         }
     }
 
+    ras_base_allocation_found(jdata, &nodes);
+    PMIX_RELEASE(caddy);
+    return;
+
+DISPLAY:
+    ras_base_allocation_found(jdata, NULL);
+    PMIX_RELEASE(caddy);
+}
+
+/* Insert the nodes and move the job on. nodes is NULL when the allocation
+ * already exists. */
+static void ras_base_allocation_found(prte_job_t *jdata, pmix_list_t *nodes)
+{
+    prte_node_t *node;
+    int32_t j;
+    pmix_status_t ret;
+    char *hosts;
+    char **hostlist;
+    char *ptr;
+    int rc;
+
+    if (NULL == nodes) {
+        goto DISPLAY;
+    }
+
     /* if we didn't find anything, and an allocation is required,
      * then that's an error
      */
-    if (pmix_list_is_empty(&nodes)) {
+    if (pmix_list_is_empty(nodes)) {
         if (prte_allocation_required) {
             /* an allocation is required, so this is fatal */
-            PMIX_LIST_DESTRUCT(&nodes);
+            PMIX_LIST_DESTRUCT(nodes);
             prte_show_help(PRTE_JOB_NSPACE(jdata), "help-ras-base.txt", "ras-base:no-allocation", true);
             PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_ALLOC_FAILED);
-            PMIX_RELEASE(caddy);
             return;
         }
 
@@ -421,9 +441,8 @@ void prte_ras_base_allocate(int fd, short args, void *cbdata)
         node = PMIX_NEW(prte_node_t);
         if (NULL == node) {
             PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
-            PMIX_LIST_DESTRUCT(&nodes);
+            PMIX_LIST_DESTRUCT(nodes);
             PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_ALLOC_FAILED);
-            PMIX_RELEASE(caddy);
             return;
         }
         /* use the same name we got in prte_process_info so we avoid confusion in
@@ -434,7 +453,7 @@ void prte_ras_base_allocate(int fd, short args, void *cbdata)
         node->slots_inuse = 0;
         node->slots_max = 0;
         node->slots = 1;
-        pmix_list_append(&nodes, &node->super);
+        pmix_list_append(nodes, &node->super);
         /* mark the HNP as "allocated" since we have nothing else to use */
         prte_hnp_is_allocated = true;
     }
@@ -442,14 +461,13 @@ void prte_ras_base_allocate(int fd, short args, void *cbdata)
     /* store the results in the global resource pool - this removes the
      * list items
      */
-    if (PRTE_SUCCESS != (rc = prte_ras_base_node_insert(&nodes, jdata))) {
+    if (PRTE_SUCCESS != (rc = prte_ras_base_node_insert(nodes, jdata))) {
         PRTE_ERROR_LOG(rc);
-        PMIX_LIST_DESTRUCT(&nodes);
+        PMIX_LIST_DESTRUCT(nodes);
         PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_ALLOC_FAILED);
-        PMIX_RELEASE(caddy);
         return;
     }
-    PMIX_LIST_DESTRUCT(&nodes);
+    PMIX_LIST_DESTRUCT(nodes);
 
 DISPLAY:
     /* the DVM's base allocation is now established; any later job that does
@@ -473,7 +491,6 @@ DISPLAY:
         if (PMIX_SUCCESS != ret && PMIX_OPERATION_SUCCEEDED != ret) {
             PMIX_ERROR_LOG(ret);
             PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_ALLOC_FAILED);
-            PMIX_RELEASE(caddy);
             return;
         }
     }
@@ -538,8 +555,11 @@ topodone:
     /* set the job state to the next position */
     PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_ALLOCATION_COMPLETE);
 
-    /* cleanup */
-    PMIX_RELEASE(caddy);
+}
+
+void prte_ras_base_allocation_granted(prte_job_t *jdata, pmix_list_t *nodes)
+{
+    ras_base_allocation_found(jdata, nodes);
 }
 
 void prte_ras_base_release_allocation(prte_session_t *session)

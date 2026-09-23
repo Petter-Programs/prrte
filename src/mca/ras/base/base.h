@@ -93,6 +93,10 @@ PRTE_EXPORT void prte_ras_base_display_cpus(prte_job_t *jdata, char *nodelist);
 
 PRTE_EXPORT void prte_ras_base_allocate(int fd, short args, void *cbdata);
 
+/* Complete the allocation of a job whose allocator returned
+ * PRTE_ERR_ALLOCATION_PENDING. Call from the progress thread. */
+PRTE_EXPORT void prte_ras_base_allocation_granted(prte_job_t *jdata, pmix_list_t *nodes);
+
 PRTE_EXPORT void prte_ras_base_modify(int fd, short args, void *cbdata);
 
 /* Is any daemon still joining the DVM?  No shrink campaign may be created
