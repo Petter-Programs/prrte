@@ -807,17 +807,15 @@ static int test_pmix_gate(void)
         prte_ras_base_module_t *mod = (prte_ras_base_module_t *) module;
         pmix_list_t nodes;
 
-        /* it discovers nothing: this component forwards runtime requests to
-         * a scheduler and never contributes a node to initial discovery.
-         * Worth pinning because the query gate above now makes it the sole
-         * selected module whenever anyone points it at a scheduler, so this
-         * return is what sends the base to its local-node fallback rather
-         * than to another allocator. */
+        /* it asks the scheduler for the allocation; with no scheduler it
+         * must fail rather than fall back to the local node */
         CHECK("pmix: has an allocate", NULL != mod->allocate);
         if (NULL != mod->allocate) {
             PMIX_CONSTRUCT(&nodes, pmix_list_t);
-            CHECK("pmix: allocate contributes nothing",
-                  PRTE_ERR_TAKE_NEXT_OPTION == mod->allocate(NULL, &nodes));
+            rc = mod->allocate(NULL, &nodes);
+            CHECK("pmix: allocate without a scheduler fails",
+                  PRTE_SUCCESS != rc && PRTE_ERR_TAKE_NEXT_OPTION != rc &&
+                  PRTE_ERR_ALLOCATION_PENDING != rc);
             CHECK("pmix: allocate leaves the list empty",
                   0 == pmix_list_get_size(&nodes));
             PMIX_LIST_DESTRUCT(&nodes);

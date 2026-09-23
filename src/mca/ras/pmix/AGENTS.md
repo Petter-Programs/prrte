@@ -17,30 +17,30 @@ set it declines, which matters because selection keeps exactly one
 module: answering on spec would shadow `ras/hosts` (priority 1) in every
 unmanaged environment and nothing would read a hostfile.
 
-Its `allocate` does nothing — this component exists for **runtime
-allocation requests** (`modify`) that a scheduler must satisfy. Note the
-consequence of that under single-owner selection: pointing a DVM at a
-PMIx scheduler makes this the allocator, and it discovers no initial
-allocation at all, so the base falls through to the one-slot local-node
-fabrication (or to `ras-base:no-allocation` under
-`prte_allocation_required`). That is recorded in
-[`docs/todo.rst`](../../../../docs/todo.rst) along with the rest of what
-this component does not yet do.
+Its `allocate` asks the scheduler for the DVM's allocation (a
+`PMIX_ALLOC_NEW` with no resources) and returns
+`PRTE_ERR_ALLOCATION_PENDING`; the answer completes it through
+`prte_ras_base_allocation_granted()`. Each allocation the scheduler grants
+is a session in the general pool, as under `ras/slurm`.
 
 Files:
 
 | File | Contents |
 |------|----------|
 | `ras_pmix_component.c` | Registration; `open`/`register`; `query` returns the module at priority 20; scheduler-connection MCA params. |
-| `ras_pmix.c` | `init` (publish the scheduler's whereabouts), `allocate` (no-op), `modify`, `finalize`, and the async passthrough callbacks. |
+| `ras_pmix.c` | `init`, `allocate`, `modify`, `finalize`, and the async callbacks. |
+| `ras_pmix_alloc.c` | Sessions for granted allocations, grows, releases, `shrink_complete`. |
 | `ras_pmix.h` | `prte_ras_pmix_component_t` (server procid, uri, connection order, retries, …). |
 
 ---
 
 ## How it works
 
-- **`allocate()`** always returns `PRTE_ERR_TAKE_NEXT_OPTION` — it never
-  contributes nodes to initial discovery.
+- **`allocate()`** asks the scheduler for the DVM's allocation.
+- An `EXTEND` that names none of PRRTE's reservations is a new scheduler
+  allocation, applied by `prte_ras_pmix_grow()`. A `RELEASE` of the
+  scheduler's nodes is shrunk locally, and the scheduler gets a
+  `PMIX_ALLOC_RELEASE` from `shrink_complete`.
 - **`modify()`** first calls `prte_pmix_set_scheduler()` to attach to a
   scheduler; if none is reachable it answers `PMIX_ERR_UNREACH`. When a
   scheduler *is* attached, it appends the requester's id
@@ -147,11 +147,7 @@ Files:
   arrives with `copy == true` (see `pmix_server.c`), so this is a live
   path, not a theoretical one.
 
-- **Nothing here ever gives anything back.** The module declares
-  `scheduler_owned = true` but implements neither `release_allocation`
-  nor `shrink_complete`, the two hooks the framework offers for handing
-  nodes back to the RM, and a request the scheduler grants but PRRTE then
-  fails to apply locally is not compensated either. See
+- **`release_allocation` is not implemented.** See
   [`docs/todo.rst`](../../../../docs/todo.rst).
 
 - **The parameters have to be *pushed*, because the boundary only crosses

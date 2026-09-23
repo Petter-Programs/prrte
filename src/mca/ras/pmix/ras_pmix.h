@@ -4,6 +4,8 @@
  * Copyright (c) 2019      Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2026      Barcelona Supercomputing Center (BSC-CNS).
+ *                         All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -35,6 +37,18 @@ typedef struct prte_ras_pmix_component_t prte_ras_pmix_component_t;
 
 PRTE_EXPORT extern prte_ras_pmix_component_t prte_mca_ras_pmix_component;
 PRTE_EXPORT extern prte_ras_base_module_t prte_ras_pmix_module;
+
+int prte_ras_pmix_give_back(const char *alloc_id, char **nodes);
+
+/* ras_pmix_alloc.c */
+void prte_ras_pmix_alloc_init(void);
+void prte_ras_pmix_alloc_finalize(void);
+int prte_ras_pmix_adopt_allocation(prte_job_t *jdata, pmix_info_t *info, size_t ninfo);
+bool prte_ras_pmix_names_reservation(prte_pmix_server_req_t *req);
+void prte_ras_pmix_grow(prte_pmix_server_req_t *req);
+bool prte_ras_pmix_release_is_ours(prte_pmix_server_req_t *req);
+pmix_status_t prte_ras_pmix_serve_release(prte_pmix_server_req_t *req);
+void prte_ras_pmix_shrink_complete(prte_shrink_campaign_t *campaign);
 
 END_C_DECLS
 
