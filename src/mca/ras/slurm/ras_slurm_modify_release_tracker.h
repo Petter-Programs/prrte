@@ -32,6 +32,8 @@ PMIX_CLASS_DECLARATION(prte_ras_slurm_release_action_t);
 typedef struct {
     pmix_list_item_t super;
     prte_shrink_campaign_t *campaign;
+    /* The campaign has drained and is ours to finish */
+    bool finishing;
     pmix_list_t actions;
 } prte_ras_slurm_shrink_tracker_t;
 PMIX_CLASS_DECLARATION(prte_ras_slurm_shrink_tracker_t);

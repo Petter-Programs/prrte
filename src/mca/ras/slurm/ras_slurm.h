@@ -34,6 +34,8 @@
 
 #include "prte_config.h"
 
+#include <stdio.h>
+#include <sys/types.h>
 #include <time.h>
 
 #include "src/mca/ras/base/base.h"
@@ -58,13 +60,13 @@ bool prte_ras_slurm_have_jansson(void);
  * set up bookkeeping at init time) pass quiet=true to suppress that. */
 bool prte_ras_slurm_have_extensions(bool quiet);
 
-/* Features requiring JSON parser */
-int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table, time_t *start_time,
-                                      time_t *end_time);
-int prte_ras_slurm_add_modified_resources(const char *slurm_jobid, pmix_list_t *node_list);
-int prte_ras_slurm_check_resources(const char *slurm_jobid, time_t *start_time,
-                                   time_t *end_time);
-int prte_ras_slurm_get_job_times(const char *slurm_jobid, time_t *start_time, time_t *end_time);
+/* Features requiring JSON parser. Each reads "scontrol show job --json"
+ * output, as prte_ras_slurm_read_job hands it over. */
+int prte_ras_slurm_extract_job_fields(FILE *fp, pmix_hash_table_t *values_table,
+                                      time_t *start_time, time_t *end_time);
+int prte_ras_slurm_add_modified_resources(FILE *fp, pmix_list_t *node_list);
+int prte_ras_slurm_check_resources(FILE *fp, time_t *start_time, time_t *end_time);
+int prte_ras_slurm_get_job_times(FILE *fp, time_t *start_time, time_t *end_time);
 
 /* Features to serve cancel requests */
 int prte_ras_slurm_add_pending_req(const char *request_id, const char *slurm_job_id);
@@ -78,7 +80,7 @@ int prte_ras_slurm_serve_cancel_req(prte_pmix_server_req_t *req);
 int prte_ras_slurm_modify_extend_init(void);
 int prte_ras_slurm_modify_extend_finalize(void);
 int prte_ras_slurm_serve_extend_req(prte_pmix_server_req_t *req);
-void prte_ras_slurm_extend_abort_request(const char *request_id);
+bool prte_ras_slurm_extend_abort_request(const char *request_id);
 
 /* Features to serve release requests */
 int prte_ras_slurm_modify_release_init(void);
@@ -94,6 +96,9 @@ void prte_ras_slurm_run_cmd_finalize(void);
 int prte_ras_slurm_run_cmd(const char *cmdline, prte_ras_slurm_cmd_cbfunc_t cbfunc,
                            pmix_object_t *cbdata);
 void prte_ras_slurm_reap(pid_t pid);
+int prte_ras_slurm_read_job(const char *slurm_jobid, prte_ras_slurm_cmd_cbfunc_t cbfunc,
+                            pmix_object_t *cbdata);
+int prte_ras_slurm_query_status(int status);
 typedef void (*prte_ras_slurm_kill_cbfunc_t)(pmix_object_t *cbdata);
 int prte_ras_slurm_kill_job(const char *slurm_jobid);
 int prte_ras_slurm_kill_job_then(const char *slurm_jobid, prte_ras_slurm_kill_cbfunc_t cbfunc,

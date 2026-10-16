@@ -66,13 +66,19 @@ typedef struct {
     char *request_id;
     bool user_request_id_provided;
     char *job_id;
+    /* request_id names this extend's pending-request record */
+    bool pending_added;
     int err;
     uint64_t retry_delay_usec;
     int attempts;
     int tracker_index;
+    /* What the request asked for, until the expander is submitted */
+    uint64_t num_nodes;
+    char **node_names;
     /* What the grant check read from the expander's record, for the trim */
     time_t start_time;
     time_t end_time;
+    long trim_minutes;
     /* Answered; the answer is posted but not yet delivered */
     bool completing;
 } prte_slurm_wait_tracker_t;
@@ -116,7 +122,8 @@ static int prte_ras_slurm_add_reused_nodes_to_session(const char *slurm_jobid,
 static void prte_ras_slurm_rollback_session(const char *slurm_jobid);
 static int prte_ras_slurm_vet_node_list(char **names, uint64_t *count);
 static int prte_ras_slurm_limit_to_parent_remainder(pmix_hash_table_t *fields, time_t parent_end);
-static int prte_ras_slurm_trim_job_to_parent(const char *slurm_jobid, time_t start, time_t end);
+static void prte_ras_slurm_trim_job_to_parent(prte_slurm_wait_tracker_t *trk);
+static void prte_ras_slurm_extend_complete(prte_slurm_wait_tracker_t *trk, FILE *record);
 static void prte_ras_slurm_extend_wait_complete(int fd, short args, void *cbdata);
 static void slurm_grant_check_cb(int fd, short args, void *cbdata);
 static prte_slurm_wait_tracker_t *prte_ras_slurm_tracker_for_child(const prte_slurm_salloc_child_t *child);
@@ -229,12 +236,16 @@ static void swt_con(prte_slurm_wait_tracker_t *p)
     p->request_id = NULL;
     p->user_request_id_provided = false;
     p->job_id = NULL;
+    p->pending_added = false;
     p->err = PRTE_SUCCESS;
     p->retry_delay_usec = PRTE_SLURM_GRANT_RETRY_MIN_USEC;
     p->attempts = 0;
     p->tracker_index = -1;
+    p->num_nodes = 0;
+    p->node_names = NULL;
     p->start_time = 0;
     p->end_time = 0;
+    p->trim_minutes = 0;
     p->completing = false;
 }
 
@@ -250,6 +261,8 @@ static void swt_des(prte_slurm_wait_tracker_t *p)
     if (NULL != p->request_id) {
         free(p->request_id);
     }
+
+    PMIx_Argv_free(p->node_names);
 
     if (NULL != p->req) {
         PMIX_RELEASE(p->req);
@@ -1619,6 +1632,93 @@ static int prte_ras_slurm_limit_to_parent_remainder(pmix_hash_table_t *fields, t
     return PRTE_SUCCESS;
 }
 
+static void prte_ras_slurm_trim_failed(prte_slurm_wait_tracker_t *trk, int err)
+{
+    pmix_output(0, "ras:slurm:modify: could not align job %s with the end of"
+                   " the parent allocation: %s. It may outlive the DVM.",
+                trk->job_id, prte_strerror(err));
+}
+
+static void prte_ras_slurm_trim_update_cb(int status, FILE *out, void *cbdata)
+{
+    prte_slurm_wait_tracker_t *trk = (prte_slurm_wait_tracker_t *) cbdata;
+    char err_msg[PRTE_SLURM_ERR_STR_MAX_LEN + 1];
+
+    if (!WIFEXITED(status) || 0 != WEXITSTATUS(status)) {
+        if (PRTE_SUCCESS != prte_ras_slurm_drain_cmd_output(out, err_msg, sizeof(err_msg))) {
+            err_msg[0] = '\0';
+        }
+        pmix_output(0, "ras:slurm:trim_job: could not set the time limit of job %s"
+                       " to %ld minute(s): %s",
+                    trk->job_id, trk->trim_minutes, err_msg);
+        prte_ras_slurm_trim_failed(trk, PRTE_ERR_SLURM_UPDATE_FAILURE);
+        return;
+    }
+
+    PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
+                         "%s ras:slurm:trim_job: job %s now ends with parent job %s,"
+                         " %ld minute(s) from its start",
+                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), trk->job_id,
+                         prte_common_slurm_jobid(), trk->trim_minutes));
+}
+
+static void prte_ras_slurm_trim_parent_cb(int status, FILE *out, void *cbdata)
+{
+    prte_slurm_wait_tracker_t *trk = (prte_slurm_wait_tracker_t *) cbdata;
+    static const char *cmd_format = "scontrol update job %s TimeLimit=%ld 2>&1";
+    time_t parent_end = 0;
+    char *cmd = NULL;
+    int err;
+
+    err = prte_ras_slurm_query_status(status);
+    if (PRTE_SUCCESS == err) {
+        err = prte_ras_slurm_get_job_times(out, NULL, &parent_end);
+    }
+    if (PRTE_SUCCESS != err) {
+        prte_ras_slurm_trim_failed(trk, err);
+        return;
+    }
+
+    if (0 == parent_end) {
+        PMIX_OUTPUT_VERBOSE((10, prte_ras_base_framework.framework_output,
+                             "%s ras:slurm:trim_job: parent job %s has no end time;"
+                             " leaving job %s as submitted",
+                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), prte_common_slurm_jobid(),
+                             trk->job_id));
+        return;
+    }
+
+    /* Never lengthen */
+    if (0 != trk->end_time && trk->end_time <= parent_end) {
+        return;
+    }
+
+    /* Truncate rather than round, so the trimmed job cannot end after the
+     * parent does. Slurm reads a limit of 0 as "no limit", the opposite of
+     * what is asked here, so a window under a minute becomes one minute. */
+    trk->trim_minutes = (long) ((parent_end - trk->start_time) / PRTE_SLURM_SECS_PER_MINUTE);
+    if (1 > trk->trim_minutes) {
+        trk->trim_minutes = 1;
+    }
+
+    if (0 > asprintf(&cmd, cmd_format, trk->job_id, trk->trim_minutes)) {
+        PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
+        prte_ras_slurm_trim_failed(trk, PRTE_ERR_OUT_OF_RESOURCE);
+        return;
+    }
+
+    PMIX_OUTPUT_VERBOSE((10, prte_ras_base_framework.framework_output,
+                         "%s ras:slurm:trim_job: trim command is:\n%s",
+                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), cmd));
+
+    err = prte_ras_slurm_run_cmd(cmd, prte_ras_slurm_trim_update_cb, &trk->super);
+    free(cmd);
+
+    if (PRTE_SUCCESS != err) {
+        prte_ras_slurm_trim_failed(trk, err);
+    }
+}
+
 /**
  * @brief Trim an expander job's time limit to the end of the parent allocation.
  *
@@ -1629,131 +1729,37 @@ static int prte_ras_slurm_limit_to_parent_remainder(pmix_hash_table_t *fields, t
  * job's own start, hence the arithmetic rather than an end time.
  *
  * Only ever shortens. A parent with no end time, or an expander that already
- * ends first, is left alone.
+ * ends first, is left alone. Runs on its own: a failure is reported, and the
+ * extend does not wait for it.
  *
- * @param[in] slurm_jobid Slurm job ID of the running expander job.
+ * @param[in] trk The granted extend, with the expander's start and end times.
  */
-static int prte_ras_slurm_trim_job_to_parent(const char *slurm_jobid, time_t start, time_t end)
+static void prte_ras_slurm_trim_job_to_parent(prte_slurm_wait_tracker_t *trk)
 {
-    int err = PRTE_SUCCESS;
-    char *parent_jobid = NULL;
-    char *cmd = NULL;
-    FILE *fp = NULL;
-    time_t parent_end = 0;
-    long minutes;
-    static const char *cmd_format = "scontrol update job %s TimeLimit=%ld 2>&1";
-    char err_msg[PRTE_SLURM_ERR_STR_MAX_LEN + 1];
+    char *parent_jobid = prte_common_slurm_jobid();
+    int err;
 
-    if (NULL == slurm_jobid) {
-        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
-        return PRTE_ERR_BAD_PARAM;
-    }
-
-    err = prte_ras_slurm_validate_jobid(slurm_jobid);
-    if (PRTE_SUCCESS != err) {
-        PRTE_ERROR_LOG(err);
-        return err;
-    }
-
-    parent_jobid = prte_common_slurm_jobid();
     if (NULL == parent_jobid) {
-        return PRTE_ERR_NOT_FOUND;
+        prte_ras_slurm_trim_failed(trk, PRTE_ERR_NOT_FOUND);
+        return;
     }
 
     /* Slurm counts the limit from the start, so without one there is nothing
      * to measure. */
-    if (0 == start) {
+    if (0 == trk->start_time) {
         PMIX_OUTPUT_VERBOSE((10, prte_ras_base_framework.framework_output,
                              "%s ras:slurm:trim_job: job %s reports no start time",
-                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), slurm_jobid));
-        return PRTE_ERR_NOT_FOUND;
+                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), trk->job_id));
+        prte_ras_slurm_trim_failed(trk, PRTE_ERR_NOT_FOUND);
+        return;
     }
 
     /* Read the parent last: nothing re-trims afterwards, so a parent shortened
      * between the two queries must land on this side of the arithmetic. */
-    err = prte_ras_slurm_get_job_times(parent_jobid, NULL, &parent_end);
+    err = prte_ras_slurm_read_job(parent_jobid, prte_ras_slurm_trim_parent_cb, &trk->super);
     if (PRTE_SUCCESS != err) {
-        return err;
+        prte_ras_slurm_trim_failed(trk, err);
     }
-
-    if (0 == parent_end) {
-        PMIX_OUTPUT_VERBOSE((10, prte_ras_base_framework.framework_output,
-                             "%s ras:slurm:trim_job: parent job %s has no end time;"
-                             " leaving job %s as submitted",
-                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), parent_jobid,
-                             slurm_jobid));
-        return PRTE_SUCCESS;
-    }
-
-    /* Never lengthen */
-    if (0 != end && end <= parent_end) {
-        return PRTE_SUCCESS;
-    }
-
-    /* Truncate rather than round, so the trimmed job cannot end after the
-     * parent does. Slurm reads a limit of 0 as "no limit", the opposite of
-     * what is asked here, so a window under a minute becomes one minute. */
-    minutes = (long) ((parent_end - start) / PRTE_SLURM_SECS_PER_MINUTE);
-    if (1 > minutes) {
-        minutes = 1;
-    }
-
-    if (0 > asprintf(&cmd, cmd_format, slurm_jobid, minutes)) {
-        cmd = NULL;
-        err = PRTE_ERR_OUT_OF_RESOURCE;
-        PRTE_ERROR_LOG(err);
-        goto cleanup;
-    }
-
-    PMIX_OUTPUT_VERBOSE((10, prte_ras_base_framework.framework_output,
-                         "%s ras:slurm:trim_job: trim command is:\n%s",
-                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), cmd));
-
-    fp = popen(cmd, "r");
-    if (NULL == fp) {
-        err = PRTE_ERR_FILE_OPEN_FAILURE;
-        PRTE_ERROR_LOG(err);
-        goto cleanup;
-    }
-
-    err = prte_ras_slurm_drain_cmd_output(fp, err_msg, sizeof(err_msg));
-    if (PRTE_SUCCESS != err) {
-        PRTE_ERROR_LOG(err);
-        goto cleanup;
-    }
-
-    int status = pclose(fp);
-    fp = NULL;
-
-    if (-1 == status) {
-        pmix_output(0, "ras:slurm:trim_job: pclose failed: %s.", strerror(errno));
-        err = PRTE_ERR_IN_ERRNO;
-        goto cleanup;
-    }
-
-    if (!WIFEXITED(status) || 0 != WEXITSTATUS(status)) {
-        pmix_output(0, "ras:slurm:trim_job: could not set the time limit of job %s"
-                       " to %ld minute(s): %s",
-                    slurm_jobid, minutes, err_msg);
-        err = PRTE_ERR_SLURM_UPDATE_FAILURE;
-        goto cleanup;
-    }
-
-    PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
-                         "%s ras:slurm:trim_job: job %s now ends with parent job %s,"
-                         " %ld minute(s) from its start",
-                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), slurm_jobid,
-                         parent_jobid, minutes));
-
-    cleanup:
-
-    if (NULL != fp) {
-        pclose(fp);
-    }
-
-    free(cmd);
-
-    return err;
 }
 
 /**
@@ -1763,11 +1769,13 @@ static int prte_ras_slurm_trim_job_to_parent(const char *slurm_jobid, time_t sta
  * Newly added nodes are validated, assigned to a session, and inserted into
  * the global node pool. On success, daemon launch is triggered on the new
  * resources and the original request callback is completed.
+ *
+ * @param[in] trk The extend, with trk->err saying how it went.
+ * @param[in] record The expander's "scontrol show job --json" output; read
+ *                   only when trk->err is PRTE_SUCCESS.
  */
-static void prte_ras_slurm_extend_wait_complete(int fd, short args, void *cbdata)
+static void prte_ras_slurm_extend_complete(prte_slurm_wait_tracker_t *trk, FILE *record)
 {
-    PRTE_HIDE_UNUSED_PARAMS(fd, args);
- 
     pmix_list_t added_nodes;
     pmix_pointer_array_t reused_nodes;
     bool have_added_nodes = false;
@@ -1776,8 +1784,7 @@ static void prte_ras_slurm_extend_wait_complete(int fd, short args, void *cbdata
     bool requester_recorded = false;
     int added_node_count = 0;
     int reused_node_count = 0;
-    
-    prte_slurm_wait_tracker_t *trk = cbdata;
+
     prte_pmix_server_req_t *req = trk->req;
 
     char *job_id = trk->job_id;
@@ -1799,14 +1806,7 @@ static void prte_ras_slurm_extend_wait_complete(int fd, short args, void *cbdata
      * failed trim is not fatal: the nodes are granted and usable, and the job
      * is scancelled with its session either way. */
     if (prte_mca_ras_slurm_component.propagate_time) {
-        int trim_err = prte_ras_slurm_trim_job_to_parent(job_id, trk->start_time,
-                                                         trk->end_time);
-
-        if (PRTE_SUCCESS != trim_err) {
-            pmix_output(0, "ras:slurm:modify: could not align job %s with the end of"
-                           " the parent allocation: %s. It may outlive the DVM.",
-                        job_id, prte_strerror(trim_err));
-        }
+        prte_ras_slurm_trim_job_to_parent(trk);
     }
 
     PMIX_CONSTRUCT(&added_nodes, pmix_list_t);
@@ -1814,7 +1814,7 @@ static void prte_ras_slurm_extend_wait_complete(int fd, short args, void *cbdata
     PMIX_CONSTRUCT(&reused_nodes, pmix_pointer_array_t);
     have_reused_nodes = true;
 
-    err = prte_ras_slurm_add_modified_resources(job_id, &added_nodes);
+    err = prte_ras_slurm_add_modified_resources(record, &added_nodes);
 
     if(PRTE_SUCCESS != err) {
         goto complete;
@@ -1905,8 +1905,10 @@ static void prte_ras_slurm_extend_wait_complete(int fd, short args, void *cbdata
         /* Gone already, whether we asked or Slurm did. Drop the record rather
          * than cancel it, or the job id outlives the job and is scancelled
          * again later. */
-        prte_ras_slurm_remove_pending_req(request_id);
-    } else if(PRTE_SUCCESS != err && !resources_added) {
+        if (trk->pending_added) {
+            prte_ras_slurm_remove_pending_req(request_id);
+        }
+    } else if(PRTE_SUCCESS != err && !resources_added && trk->pending_added) {
         prte_ras_slurm_cancel_pending_req(request_id);
     }
 
@@ -1973,21 +1975,35 @@ static void prte_ras_slurm_extend_wait_complete(int fd, short args, void *cbdata
     PMIX_RELEASE(trk);
 }
 
-/**
- * @brief Ask Slurm what became of an expander job.
- *
- * Runs when the submitting salloc exits. Retries briefly and boundedly: this
- * closes a gap of milliseconds, not a queue wait.
- */
-static void slurm_grant_check_cb(int fd, short args, void *cbdata)
+/* Answer an extend from an event, for a request cancelled meanwhile */
+static void prte_ras_slurm_extend_wait_complete(int fd, short args, void *cbdata)
 {
     PRTE_HIDE_UNUSED_PARAMS(fd, args);
 
-    prte_slurm_wait_tracker_t *trk = cbdata;
+    prte_ras_slurm_extend_complete((prte_slurm_wait_tracker_t *) cbdata, NULL);
+}
+
+/**
+ * @brief Read what became of an expander job, and carry on with the extend.
+ *
+ * Retries briefly and boundedly: this closes a gap of milliseconds, not a
+ * queue wait.
+ */
+static void slurm_grant_record_cb(int status, FILE *out, void *cbdata)
+{
+    prte_slurm_wait_tracker_t *trk = (prte_slurm_wait_tracker_t *) cbdata;
 
     int err;
 
-    err = prte_ras_slurm_check_resources(trk->job_id, &trk->start_time, &trk->end_time);
+    /* Answered by a cancel while scontrol ran */
+    if (trk->completing) {
+        return;
+    }
+
+    err = prte_ras_slurm_query_status(status);
+    if (PRTE_SUCCESS == err) {
+        err = prte_ras_slurm_check_resources(out, &trk->start_time, &trk->end_time);
+    }
 
     if (PRTE_ERR_RESOURCE_BUSY == err && PRTE_SLURM_GRANT_RETRY_MAX > trk->attempts) {
 
@@ -2026,26 +2042,54 @@ static void slurm_grant_check_cb(int fd, short args, void *cbdata)
 
     trk->err = err;
 
-    prte_ras_slurm_extend_wait_complete(-1, 0, trk);
+    /* The record that said the job is running also lists its nodes */
+    if (PRTE_SUCCESS == err) {
+        rewind(out);
+    }
+    prte_ras_slurm_extend_complete(trk, PRTE_SUCCESS == err ? out : NULL);
+}
+
+/**
+ * @brief Ask Slurm what became of an expander job.
+ *
+ * Runs when the submitting salloc exits, and from the retry timer.
+ */
+static void slurm_grant_check_cb(int fd, short args, void *cbdata)
+{
+    PRTE_HIDE_UNUSED_PARAMS(fd, args);
+
+    prte_slurm_wait_tracker_t *trk = cbdata;
+    int err;
+
+    err = prte_ras_slurm_read_job(trk->job_id, slurm_grant_record_cb, &trk->super);
+
+    if (PRTE_SUCCESS != err) {
+        trk->err = err;
+        prte_ras_slurm_extend_complete(trk, NULL);
+    }
 }
 
 /**
  * @brief Answer an extend whose Slurm job has just been cancelled.
  *
  * Call after cancelling the job and removing its pending record; the completion
- * reads that record to decide whether the job needs cancelling.
+ * reads that record to decide whether the job needs cancelling. An extend
+ * still reading its parent's record has no job and no record yet, and is
+ * answered all the same.
  *
  * The answer is posted, not delivered here, so the cancel is answered before
  * the extend it cancelled.
  *
  * @param[in] request_id PMIx request identifier of the extend to answer.
+ *
+ * @return true when an extend in flight had that identifier.
  */
-void prte_ras_slurm_extend_abort_request(const char *request_id)
+bool prte_ras_slurm_extend_abort_request(const char *request_id)
 {
     struct timeval immediate = {0, 0};
 
     if (!extend_initialized || NULL == request_id) {
-        return;
+        return false;
     }
 
     for (int i = 0; i < prte_slurm_wait_trackers.size; i++) {
@@ -2068,7 +2112,180 @@ void prte_ras_slurm_extend_abort_request(const char *request_id)
         prte_event_set(prte_event_base, &trk->ev, -1, 0,
                        prte_ras_slurm_extend_wait_complete, trk);
         prte_event_evtimer_add(&trk->ev, &immediate);
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * @brief Submit the expander job, once the parent's record has been read.
+ */
+static void prte_ras_slurm_extend_parent_cb(int status, FILE *out, void *cbdata)
+{
+    prte_slurm_wait_tracker_t *trk = (prte_slurm_wait_tracker_t *) cbdata;
+
+    int err = PRTE_SUCCESS;
+    int pmix_err = PMIX_SUCCESS;
+
+    pmix_hash_table_t slurm_jobfields;
+    bool have_slurm_jobfields = false;
+    time_t parent_end = 0;
+
+    char *nodes_string = NULL;
+    char *job_id = NULL;
+
+    /* Answered by a cancel while scontrol ran */
+    if (trk->completing) {
         return;
+    }
+
+    err = prte_ras_slurm_query_status(status);
+
+    if(PRTE_SUCCESS != err) {
+        goto cleanup;
+    }
+
+    PMIX_CONSTRUCT(&slurm_jobfields, pmix_hash_table_t);
+
+    have_slurm_jobfields = true;
+
+    pmix_err = pmix_hash_table_init(&slurm_jobfields, total_fields_len);
+
+    if(PMIX_SUCCESS != pmix_err) {
+        err = prte_pmix_convert_status(pmix_err);
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
+    }
+
+    err = prte_ras_slurm_extract_job_fields(out, &slurm_jobfields, NULL, &parent_end);
+
+    if(PRTE_SUCCESS != err) {
+        goto cleanup;
+    }
+
+    /* Ask for what is left of the parent, not for its whole limit again.
+     * Failing to work that out is not fatal - the parent's limit is a valid,
+     * if generous, request, and the trim at the grant is what makes the
+     * window exact. */
+    if (prte_mca_ras_slurm_component.propagate_time) {
+        int limit_err = prte_ras_slurm_limit_to_parent_remainder(&slurm_jobfields,
+                                                                 parent_end);
+
+        if (PRTE_SUCCESS != limit_err) {
+            pmix_output(0, "ras:slurm:modify: could not reduce the requested time"
+                           " limit to what is left of the parent allocation: %s.",
+                        prte_strerror(limit_err));
+        }
+    }
+
+    int rc = asprintf(&nodes_string, "%" PRIu64, trk->num_nodes);
+
+    if(0 > rc) {
+        nodes_string = NULL;
+        err = PRTE_ERR_OUT_OF_RESOURCE;
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
+    }
+
+    pmix_err = pmix_hash_table_set_value_ptr(&slurm_jobfields, record_job_data_fields[PRTE_JOB_DATA_NODES],
+                            strlen(record_job_data_fields[PRTE_JOB_DATA_NODES]), (void*)nodes_string);
+
+    if(PMIX_SUCCESS != pmix_err) {
+        err = prte_pmix_convert_status(pmix_err);
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
+    }
+
+    /* Now owned by hash table */
+    nodes_string = NULL;
+
+    if (NULL != trk->node_names) {
+        char *joined = PMIx_Argv_join(trk->node_names, ',');
+
+        if (NULL == joined) {
+            err = PRTE_ERR_OUT_OF_RESOURCE;
+            PRTE_ERROR_LOG(err);
+            goto cleanup;
+        }
+
+        pmix_err = pmix_hash_table_set_value_ptr(&slurm_jobfields,
+                        record_job_data_fields[PRTE_JOB_DATA_NODELIST],
+                        strlen(record_job_data_fields[PRTE_JOB_DATA_NODELIST]),
+                        (void *) joined);
+
+        if(PMIX_SUCCESS != pmix_err) {
+            free(joined);
+            err = prte_pmix_convert_status(pmix_err);
+            PRTE_ERROR_LOG(err);
+            goto cleanup;
+        }
+    }
+
+    err = prte_ras_slurm_launch_expander_job(&slurm_jobfields);
+
+    if(PRTE_SUCCESS != err) {
+        pmix_output(0, "ras:slurm:modify: error launching Slurm job with new resources.");
+        goto cleanup;
+    }
+
+    pmix_err = pmix_hash_table_get_value_ptr(&slurm_jobfields, record_job_data_fields[PRTE_JOB_DATA_JOB_ID],
+                    strlen(record_job_data_fields[PRTE_JOB_DATA_JOB_ID]), (void**)&job_id);
+
+    if(PMIX_SUCCESS != pmix_err) {
+        err = prte_pmix_convert_status(pmix_err);
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
+    }
+
+    if (NULL == trk->request_id && NULL == (trk->request_id = strdup(job_id))) {
+        prte_ras_slurm_kill_job(job_id);
+        err = PRTE_ERR_OUT_OF_RESOURCE;
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
+    }
+
+    err = prte_ras_slurm_add_pending_req(trk->request_id, job_id);
+
+    if(PRTE_SUCCESS != err) {
+        prte_ras_slurm_kill_job(job_id);
+        goto cleanup;
+    }
+
+    trk->pending_added = true;
+
+    /* From here the completion's cancel_pending_req gives the job back */
+    trk->job_id = strdup(job_id);
+
+    if(NULL == trk->job_id) {
+        err = PRTE_ERR_OUT_OF_RESOURCE;
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
+    }
+
+    /* Nothing is asked of Slurm here. salloc holds the handshake until the job
+     * leaves PENDING, so its exit is the notice that there is something to
+     * ask about. */
+    prte_ras_slurm_link_child_to_tracker(job_id, trk->tracker_index);
+
+    cleanup:
+
+    free(nodes_string);
+
+    if(have_slurm_jobfields) {
+        void *key;
+        void *val;
+
+        PMIX_HASH_TABLE_FOREACH_PTR(key, val, &slurm_jobfields, {
+            free(val);
+        });
+
+        PMIX_DESTRUCT(&slurm_jobfields);
+    }
+
+    if (PRTE_SUCCESS != err) {
+        trk->err = err;
+        prte_ras_slurm_extend_complete(trk, NULL);
     }
 }
 
@@ -2077,8 +2294,8 @@ void prte_ras_slurm_extend_abort_request(const char *request_id)
  *
  * Service a PMIx allocation request (PMIX_ALLOC_EXTEND, or the PMIX_ALLOC_NEW
  * that modify() reads as its synonym) by requesting additional nodes from
- * Slurm and adding the resulting resources to PRRTE. Current implementation
- * requires specifying PMIX_ALLOC_NUM_NODES as a PMIX_UINT64.
+ * Slurm and adding the resulting resources to PRRTE. Answers through the
+ * request's callback once the parent's record has been read.
  *
  * @param[in] req PMIx server request describing the resource extension.
  */
@@ -2095,15 +2312,7 @@ int prte_ras_slurm_serve_extend_req(prte_pmix_server_req_t *req)
     }
 
     int err = PRTE_SUCCESS;
-    int pmix_err = PMIX_SUCCESS;
 
-    pmix_hash_table_t slurm_jobfields;
-    bool have_slurm_jobfields = false;
-    time_t parent_end = 0;
-    bool pending_req_added = false;
-    
-    char *nodes_string = NULL;
-    char *job_id = NULL;
     char *request_id = NULL;
     bool user_request_id_provided = false;
 
@@ -2111,6 +2320,8 @@ int prte_ras_slurm_serve_extend_req(prte_pmix_server_req_t *req)
     bool found = false;
     char *node_string = NULL;
     char **node_names = NULL;
+    char *parent_jobid;
+    prte_slurm_wait_tracker_t *trk = NULL;
 
     for (size_t i = 0; i < req->ninfo; i++) {
 
@@ -2167,116 +2378,14 @@ int prte_ras_slurm_serve_extend_req(prte_pmix_server_req_t *req)
         goto cleanup;
     }
     
-    PMIX_CONSTRUCT(&slurm_jobfields, pmix_hash_table_t);
+    parent_jobid = prte_common_slurm_jobid();
 
-    have_slurm_jobfields = true;
-
-    pmix_err = pmix_hash_table_init(&slurm_jobfields, total_fields_len);
-
-    if(PMIX_SUCCESS != pmix_err) {
-        err = prte_pmix_convert_status(pmix_err);
-        PRTE_ERROR_LOG(err);
-        goto cleanup;
-    }
-    
-    err = prte_ras_slurm_extract_job_fields(&slurm_jobfields, NULL, &parent_end);
-
-    if(PRTE_SUCCESS != err) {
-        goto cleanup;
-    }
-
-    /* Ask for what is left of the parent, not for its whole limit again.
-     * Failing to work that out is not fatal - the parent's limit is a valid,
-     * if generous, request, and the trim at the grant is what makes the
-     * window exact. */
-    if (prte_mca_ras_slurm_component.propagate_time) {
-        int limit_err = prte_ras_slurm_limit_to_parent_remainder(&slurm_jobfields,
-                                                                 parent_end);
-
-        if (PRTE_SUCCESS != limit_err) {
-            pmix_output(0, "ras:slurm:modify: could not reduce the requested time"
-                           " limit to what is left of the parent allocation: %s.",
-                        prte_strerror(limit_err));
-        }
-    }
-
-    int rc = asprintf(&nodes_string, "%" PRIu64, num_nodes);
-    
-    if(0 > rc) {
-        err = PRTE_ERR_OUT_OF_RESOURCE;
+    if (NULL == parent_jobid) {
+        err = PRTE_ERR_NOT_FOUND;
         PRTE_ERROR_LOG(err);
         goto cleanup;
     }
 
-    pmix_err = pmix_hash_table_set_value_ptr(&slurm_jobfields, record_job_data_fields[PRTE_JOB_DATA_NODES],
-                            strlen(record_job_data_fields[PRTE_JOB_DATA_NODES]), (void*)nodes_string);
-
-    if(PMIX_SUCCESS != pmix_err) {
-        err = prte_pmix_convert_status(pmix_err);
-        PRTE_ERROR_LOG(err);
-        goto cleanup;
-    }
-
-    /* Now owned by hash table */
-    nodes_string = NULL;
-
-    if (NULL != node_names) {
-        char *joined = PMIx_Argv_join(node_names, ',');
-
-        if (NULL == joined) {
-            err = PRTE_ERR_OUT_OF_RESOURCE;
-            PRTE_ERROR_LOG(err);
-            goto cleanup;
-        }
-
-        pmix_err = pmix_hash_table_set_value_ptr(&slurm_jobfields,
-                        record_job_data_fields[PRTE_JOB_DATA_NODELIST],
-                        strlen(record_job_data_fields[PRTE_JOB_DATA_NODELIST]),
-                        (void *) joined);
-
-        if(PMIX_SUCCESS != pmix_err) {
-            free(joined);
-            err = prte_pmix_convert_status(pmix_err);
-            PRTE_ERROR_LOG(err);
-            goto cleanup;
-        }
-    }
-
-    err = prte_ras_slurm_launch_expander_job(&slurm_jobfields);
-
-    if(PRTE_SUCCESS != err) {
-        pmix_output(0, "ras:slurm:modify: error launching Slurm job with new resources.");
-        goto cleanup;
-    }
-
-    pmix_err = pmix_hash_table_get_value_ptr(&slurm_jobfields, record_job_data_fields[PRTE_JOB_DATA_JOB_ID],
-                    strlen(record_job_data_fields[PRTE_JOB_DATA_JOB_ID]), (void**)&job_id);
-
-    if(PMIX_SUCCESS != pmix_err) {
-        err = prte_pmix_convert_status(pmix_err);
-        PRTE_ERROR_LOG(err);
-        goto cleanup;
-    }
-
-    if (NULL == request_id || '\0' == request_id[0]) {
-        request_id = job_id;
-    }
-
-    err = prte_ras_slurm_add_pending_req(request_id, job_id);
-
-    if(PRTE_SUCCESS != err) {
-        prte_ras_slurm_kill_job(job_id);
-        goto cleanup;
-    }
-
-    pending_req_added = true;
-
-    /* Nothing is asked of Slurm here. salloc holds the handshake until the job
-     * leaves PENDING, so its exit is the notice that there is something to
-     * ask about. */
-
-    prte_slurm_wait_tracker_t *trk;
-    
     trk = PMIX_NEW(prte_slurm_wait_tracker_t);
 
     if(NULL == trk) {
@@ -2288,23 +2397,14 @@ int prte_ras_slurm_serve_extend_req(prte_pmix_server_req_t *req)
     trk->req = req;
     PMIX_RETAIN(req);
 
-    trk->request_id = strdup(request_id);
-
-    if(NULL == trk->request_id) {
-        err = PRTE_ERR_OUT_OF_RESOURCE;
-        PRTE_ERROR_LOG(err);
-        PMIX_RELEASE(trk);
-        goto cleanup;
-    }
-
     trk->user_request_id_provided = user_request_id_provided;
+    trk->num_nodes = num_nodes;
+    trk->node_names = node_names;
+    node_names = NULL;
 
-    trk->job_id = strdup(job_id);
-
-    if(NULL == trk->job_id) {
+    if (user_request_id_provided && NULL == (trk->request_id = strdup(request_id))) {
         err = PRTE_ERR_OUT_OF_RESOURCE;
         PRTE_ERROR_LOG(err);
-        PMIX_RELEASE(trk);
         goto cleanup;
     }
 
@@ -2313,7 +2413,6 @@ int prte_ras_slurm_serve_extend_req(prte_pmix_server_req_t *req)
     if(0 > trk->tracker_index) {
         err = PRTE_ERR_OUT_OF_RESOURCE;
         PRTE_ERROR_LOG(err);
-        PMIX_RELEASE(trk);
         goto cleanup;
     }
 
@@ -2321,31 +2420,27 @@ int prte_ras_slurm_serve_extend_req(prte_pmix_server_req_t *req)
      * finalize delete it without knowing whether it ever armed. */
     prte_event_set(prte_event_base, &trk->ev, -1, 0, slurm_grant_check_cb, trk);
 
-    prte_ras_slurm_link_child_to_tracker(job_id, trk->tracker_index);
+    err = prte_ras_slurm_read_job(parent_jobid, prte_ras_slurm_extend_parent_cb, &trk->super);
+
+    if(PRTE_SUCCESS != err) {
+        pmix_pointer_array_set_item(&prte_slurm_wait_trackers, trk->tracker_index, NULL);
+        goto cleanup;
+    }
+
+    /* The registry owns trk from here */
+    trk = NULL;
 
     /* Return control to application while we wait */
     err = PRTE_ERR_OP_IN_PROGRESS;
 
     cleanup:
 
-    if(PRTE_SUCCESS != err && PRTE_ERR_OP_IN_PROGRESS != err && pending_req_added) {
-        prte_ras_slurm_cancel_pending_req(request_id);
+    if (NULL != trk) {
+        PMIX_RELEASE(trk);
     }
 
-    free(nodes_string);
     free(node_string);
     PMIx_Argv_free(node_names);
-
-    if(have_slurm_jobfields) {
-        void *key;
-        void *val;
-
-        PMIX_HASH_TABLE_FOREACH_PTR(key, val, &slurm_jobfields, {
-            free(val);
-        });
-
-        PMIX_DESTRUCT(&slurm_jobfields);
-    }
 
     return err;
 }

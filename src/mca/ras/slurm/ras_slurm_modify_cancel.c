@@ -73,11 +73,13 @@ int prte_ras_slurm_serve_cancel_req(prte_pmix_server_req_t *req)
 
     err = prte_ras_slurm_cancel_pending_req(request_id);
 
-    if (PRTE_SUCCESS == err) {
-        /* Answering the extend belongs to the extend half. After
-         * cancel_pending_req, so the completion finds no record left and does
-         * not cancel the job twice. */
-        prte_ras_slurm_extend_abort_request(request_id);
+    /* Answering the extend belongs to the extend half. After
+     * cancel_pending_req, so the completion finds no record left and does not
+     * cancel the job twice. An extend with no record yet has submitted
+     * nothing, and the answer alone stops it. */
+    if ((PRTE_SUCCESS == err || PRTE_ERR_NOT_FOUND == err) &&
+        prte_ras_slurm_extend_abort_request(request_id)) {
+        err = PRTE_SUCCESS;
     }
 
 cleanup:

@@ -51,6 +51,7 @@ static void release_action_des(prte_ras_slurm_release_action_t *p)
 static void shrink_tracker_con(prte_ras_slurm_shrink_tracker_t *p)
 {
     p->campaign = NULL;
+    p->finishing = false;
     PMIX_CONSTRUCT(&p->actions, pmix_list_t);
 }
 
@@ -63,6 +64,12 @@ static void shrink_tracker_des(prte_ras_slurm_shrink_tracker_t *p)
         PMIX_RELEASE(action);
     }
     PMIX_DESTRUCT(&p->actions);
+
+    /* Released before it finished, which only finalize does: the base no
+     * longer lists the campaign, so nothing else will */
+    if (p->finishing && NULL != p->campaign) {
+        PMIX_RELEASE(p->campaign);
+    }
 }
 
 /*

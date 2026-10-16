@@ -374,6 +374,60 @@ cleanup:
     return err;
 }
 
+/*
+ * Run "scontrol show job <id> --json" through prte_ras_slurm_run_cmd.
+ */
+int prte_ras_slurm_read_job(const char *slurm_jobid, prte_ras_slurm_cmd_cbfunc_t cbfunc,
+                            pmix_object_t *cbdata)
+{
+    static const char *cmd_format = "scontrol show job %s --json";
+    char *cmd = NULL;
+    int err;
+
+    err = prte_ras_slurm_validate_jobid(slurm_jobid);
+
+    if (PRTE_SUCCESS != err) {
+        PRTE_ERROR_LOG(err);
+        return err;
+    }
+
+    if (0 > asprintf(&cmd, cmd_format, slurm_jobid)) {
+        PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
+        return PRTE_ERR_OUT_OF_RESOURCE;
+    }
+
+    err = prte_ras_slurm_run_cmd(cmd, cbfunc, cbdata);
+    free(cmd);
+
+    return err;
+}
+
+/*
+ * Turn the wait status of "scontrol show job" into PRTE_SUCCESS or
+ * PRTE_ERR_SLURM_QUERY_FAILURE. Checked ahead of the record, whose parse
+ * errors a failed scontrol would explain.
+ */
+int prte_ras_slurm_query_status(int status)
+{
+    if (!WIFEXITED(status)) {
+        PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
+            "%s ras:slurm:read_job: scontrol died on signal %d.",
+            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), WTERMSIG(status)));
+        PRTE_ERROR_LOG(PRTE_ERR_SLURM_QUERY_FAILURE);
+        return PRTE_ERR_SLURM_QUERY_FAILURE;
+    }
+
+    if (0 != WEXITSTATUS(status)) {
+        PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
+            "%s ras:slurm:read_job: non-zero exit code (%d) from scontrol command.",
+            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), WEXITSTATUS(status)));
+        PRTE_ERROR_LOG(PRTE_ERR_SLURM_QUERY_FAILURE);
+        return PRTE_ERR_SLURM_QUERY_FAILURE;
+    }
+
+    return PRTE_SUCCESS;
+}
+
 static void kill_job_cb(int status, FILE *out, void *cbdata)
 {
     prte_ras_slurm_kill_t *kill_data = (prte_ras_slurm_kill_t *) cbdata;

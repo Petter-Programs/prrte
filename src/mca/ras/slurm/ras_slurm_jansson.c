@@ -228,118 +228,54 @@ static int prte_ras_slurm_json_walk_record(prte_json_window_t *win,
 }
 
 /*
- * Run "scontrol show job" and walk the record it prints.
+ * Walk the record "scontrol show job --json" printed.
  *
- * Owns the command and the pipe. What the record contains is
- * prte_ras_slurm_json_walk_record's business.
+ * What the record contains is prte_ras_slurm_json_walk_record's business.
  *
- * @param[in] slurm_jobid  Slurm job ID to query.
+ * @param[in] fp           the command's output.
  * @param[in] job_handler  handler for each member of the job's record.
  * @param[in] job_cbdata   passed to job_handler.
  */
-int prte_ras_slurm_json_run(const char *slurm_jobid,
-                                   prte_json_window_member_fn_t job_handler, void *job_cbdata)
+int prte_ras_slurm_json_run(FILE *fp, prte_json_window_member_fn_t job_handler,
+                            void *job_cbdata)
 {
-    static const char *cmd_format = "scontrol show job %s --json";
-
     prte_ras_slurm_json_src_t src;
     prte_json_window_t win;
     char *buf = NULL;
-    char *cmd = NULL;
-    int status;
     int err;
 
-    if (NULL == slurm_jobid || NULL == job_handler) {
+    if (NULL == fp || NULL == job_handler) {
         PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
         return PRTE_ERR_BAD_PARAM;
-    }
-
-    err = prte_ras_slurm_validate_jobid(slurm_jobid);
-
-    if (PRTE_SUCCESS != err) {
-        PRTE_ERROR_LOG(err);
-        return err;
-    }
-
-    if (0 > asprintf(&cmd, cmd_format, slurm_jobid)) {
-        PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
-        return PRTE_ERR_OUT_OF_RESOURCE;
     }
 
     buf = malloc(PRTE_SLURM_JSON_WINDOW_SIZE);
 
     if (NULL == buf) {
-        err = PRTE_ERR_OUT_OF_RESOURCE;
-        PRTE_ERROR_LOG(err);
-        goto cleanup;
+        PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
+        return PRTE_ERR_OUT_OF_RESOURCE;
     }
 
     src.io_error = false;
-    src.fp = popen(cmd, "r");
-
-    if (NULL == src.fp) {
-        err = PRTE_ERR_FILE_OPEN_FAILURE;
-        goto cleanup;
-    }
+    src.fp = fp;
 
     prte_json_window_init(&win, prte_ras_slurm_json_read, &src, buf,
                           PRTE_SLURM_JSON_WINDOW_SIZE);
     err = prte_ras_slurm_json_walk_record(&win, job_handler, job_cbdata);
     prte_json_window_drain(&win);
 
-    status = pclose(src.fp);
-    src.fp = NULL;
-
-    if (-1 == status) {
-        pmix_output(0, "ras:slurm:read_job: pclose failed: %s.", strerror(errno));
-        err = PRTE_ERR_IN_ERRNO;
-        PRTE_ERROR_LOG(err);
-        goto cleanup;
-    }
-
-    /* The record is read to the end even when a member is refused, so scontrol
-     * is never left writing into a closed pipe and its status means what it
-     * says. Its status is checked ahead of the walk's own error, which a
-     * scontrol that failed would explain. */
     if (src.io_error) {
         err = PRTE_ERR_FILE_READ_FAILURE;
         PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
             "%s ras:slurm:read_job: error reading from stream.",
             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
-        PRTE_ERROR_LOG(err);
-        goto cleanup;
-    }
-
-    if (!WIFEXITED(status)) {
-        PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
-            "%s ras:slurm:read_job: scontrol died on signal %d.",
-            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), WTERMSIG(status)));
-        err = PRTE_ERR_SLURM_QUERY_FAILURE;
-        PRTE_ERROR_LOG(err);
-        goto cleanup;
-    }
-
-    if (0 != WEXITSTATUS(status)) {
-        PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
-            "%s ras:slurm:read_job: non-zero exit code (%d) from scontrol command.",
-            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), WEXITSTATUS(status)));
-        err = PRTE_ERR_SLURM_QUERY_FAILURE;
-        PRTE_ERROR_LOG(err);
-        goto cleanup;
     }
 
     if (PRTE_SUCCESS != err) {
         PRTE_ERROR_LOG(err);
     }
 
-    cleanup:
-
-    if (NULL != src.fp) {
-        pclose(src.fp);
-    }
-
     free(buf);
-    free(cmd);
 
     return err;
 }
@@ -350,12 +286,11 @@ int prte_ras_slurm_json_run(const char *slurm_jobid,
  * What comes back is an object holding whichever of keys the record carried,
  * so the helpers that read a whole record work on it unchanged.
  *
- * @param[in]  slurm_jobid   Slurm job ID to query.
+ * @param[in]  fp            "scontrol show job --json" output.
  * @param[in]  keys          NULL-terminated member names to keep.
  * @param[out] job_info_out  New reference the caller decrefs.
  */
-int prte_ras_slurm_read_job_fields(const char *slurm_jobid, const char *const *keys,
-                                          json_t **job_info_out)
+int prte_ras_slurm_read_job_fields(FILE *fp, const char *const *keys, json_t **job_info_out)
 {
     prte_ras_slurm_json_keep_t keep;
     int err;
@@ -374,7 +309,7 @@ int prte_ras_slurm_read_job_fields(const char *slurm_jobid, const char *const *k
         return PRTE_ERR_OUT_OF_RESOURCE;
     }
 
-    err = prte_ras_slurm_json_run(slurm_jobid, prte_ras_slurm_json_keep_member, &keep);
+    err = prte_ras_slurm_json_run(fp, prte_ras_slurm_json_keep_member, &keep);
 
     if (PRTE_SUCCESS != err) {
         json_decref(keep.kept);

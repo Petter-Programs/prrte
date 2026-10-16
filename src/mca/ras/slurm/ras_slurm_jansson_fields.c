@@ -256,14 +256,15 @@ static int prte_ras_slurm_get_json_str_field(json_t *job, const char *key, pmix_
  * Missing, null, and empty optional fields are skipped. String fields that are
  * present are validated to ensure they do not contain control characters.
  *
+ * @param[in] fp "scontrol show job --json" output for this DVM's own job.
  * @param[in,out] values_table Pointer to a PMIx hash table to populate with extracted values.
 
  * Note: On failure, values_table may be partially populated.
  */
-int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table, time_t *start_time,
-                                      time_t *end_time)
+int prte_ras_slurm_extract_job_fields(FILE *fp, pmix_hash_table_t *values_table,
+                                      time_t *start_time, time_t *end_time)
 {
-    if(NULL == values_table) {
+    if(NULL == fp || NULL == values_table) {
         PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
         return PRTE_ERR_BAD_PARAM;
     }
@@ -271,12 +272,6 @@ int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table, time_t *s
     int err = PRTE_SUCCESS;
 
     json_t *job = NULL;
-
-    char *slurm_jobid;
-    if (NULL == (slurm_jobid = prte_common_slurm_jobid())) {
-        PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
-        return PRTE_ERR_NOT_FOUND;
-    }
 
     /* Built from the tables the loops below walk, so the two cannot drift. */
     const char **keys = (const char **) calloc(STR_FIELD_COUNT + NUM_OBJ_FIELD_COUNT
@@ -304,7 +299,7 @@ int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table, time_t *s
     keys[nkeys++] = "end_time";
     keys[nkeys] = NULL;
 
-    err = prte_ras_slurm_read_job_fields(slurm_jobid, keys, &job);
+    err = prte_ras_slurm_read_job_fields(fp, keys, &job);
 
     if(PRTE_SUCCESS != err) {
         goto cleanup;
@@ -400,22 +395,14 @@ int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table, time_t *s
 /*
  * Check the state of a Slurm job against RUNNING and PENDING.
  *
- * Polls Slurm job information and inspects the "job_state" JSON
- * field for PENDING and RUNNING. The function returns PRTE_SUCCESS
- * if the job reaches RUNNING.
+ * Inspects the "job_state" JSON field for PENDING and RUNNING. The
+ * function returns PRTE_SUCCESS if the job is RUNNING.
  *
- * @param[in] slurm_jobid SLURM job ID to monitor.
+ * @param[in] fp "scontrol show job --json" output for the job.
  */
-int prte_ras_slurm_check_resources(const char *slurm_jobid, time_t *start_time,
-                                   time_t *end_time)
+int prte_ras_slurm_check_resources(FILE *fp, time_t *start_time, time_t *end_time)
 {
     int err = PRTE_SUCCESS;
-
-    err = prte_ras_slurm_validate_jobid(slurm_jobid);
-
-    if(PRTE_SUCCESS != err) {
-        return PRTE_ERR_BAD_PARAM;
-    }
 
     json_t *job_info = NULL;
 
@@ -425,7 +412,7 @@ int prte_ras_slurm_check_resources(const char *slurm_jobid, time_t *start_time,
 
     static const char *const keys[] = {"job_state", "start_time", "end_time", "time_limit", NULL};
 
-    err = prte_ras_slurm_read_job_fields(slurm_jobid, keys, &job_info);
+    err = prte_ras_slurm_read_job_fields(fp, keys, &job_info);
 
     if(PRTE_SUCCESS != err) {
         goto cleanup;
@@ -505,23 +492,18 @@ int prte_ras_slurm_check_resources(const char *slurm_jobid, time_t *start_time,
 /*
  * Read a job's start and end times, in seconds since the epoch.
  *
- * @param[in]  slurm_jobid Slurm job ID to query.
+ * @param[in]  fp          "scontrol show job --json" output for the job.
  * @param[out] start_time  Job start time, or 0.
  * @param[out] end_time    Job end time, or 0 if it has none.
  */
-int prte_ras_slurm_get_job_times(const char *slurm_jobid, time_t *start_time, time_t *end_time)
+int prte_ras_slurm_get_job_times(FILE *fp, time_t *start_time, time_t *end_time)
 {
     static const char *const keys[] = {"start_time", "end_time", "time_limit", NULL};
 
     json_t *job_info = NULL;
     int err;
 
-    if (NULL == slurm_jobid) {
-        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
-        return PRTE_ERR_BAD_PARAM;
-    }
-
-    err = prte_ras_slurm_read_job_fields(slurm_jobid, keys, &job_info);
+    err = prte_ras_slurm_read_job_fields(fp, keys, &job_info);
 
     if (PRTE_SUCCESS != err) {
         return err;

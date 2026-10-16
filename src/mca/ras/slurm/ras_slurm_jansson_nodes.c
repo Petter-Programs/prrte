@@ -191,12 +191,12 @@ static int prte_ras_slurm_json_job_nodes_member(prte_json_window_t *win, const c
  * prints it after the array, so it is only settled once this returns. It
  * reads back as 1 where the record leaves it unset or infinite.
  *
- * @param[in]  slurm_jobid       Slurm job ID to query.
+ * @param[in]  fp                "scontrol show job --json" output.
  * @param[in]  node_cb           called once per allocated node.
  * @param[in]  cbdata            passed to node_cb.
  * @param[out] threads_per_core  the job's threads_per_core; may be NULL.
  */
-static int prte_ras_slurm_walk_alloc_nodes(const char *slurm_jobid,
+static int prte_ras_slurm_walk_alloc_nodes(FILE *fp,
                                            prte_ras_slurm_alloc_node_fn_t node_cb, void *cbdata,
                                            int *threads_per_core)
 {
@@ -221,16 +221,16 @@ static int prte_ras_slurm_walk_alloc_nodes(const char *slurm_jobid,
         return PRTE_ERR_OUT_OF_RESOURCE;
     }
 
-    err = prte_ras_slurm_json_run(slurm_jobid, prte_ras_slurm_json_job_nodes_member, &walk);
+    err = prte_ras_slurm_json_run(fp, prte_ras_slurm_json_job_nodes_member, &walk);
 
     if (PRTE_SUCCESS == err && !walk.seen_allocation) {
         err = PRTE_ERR_JSON_PARSE_FAILURE;
     }
 
     if (PRTE_SUCCESS == err && walk.have_count && walk.seen != walk.stated) {
-        pmix_output(0, "ras:slurm:walk_alloc_nodes: job %s says it holds %lu nodes"
+        pmix_output(0, "ras:slurm:walk_alloc_nodes: the job says it holds %lu nodes"
                        " but listed %lu.",
-                    slurm_jobid, (unsigned long) walk.stated, (unsigned long) walk.seen);
+                    (unsigned long) walk.stated, (unsigned long) walk.seen);
         err = PRTE_ERR_JSON_PARSE_FAILURE;
     }
 
@@ -391,7 +391,7 @@ static int prte_ras_slurm_alloc_list_to_nodes(prte_ras_slurm_alloc_list_t *list,
  *
  * The resulting nodes are inserted into the provided node list.
  *
- * @param[in] slurm_jobid Slurm job ID.
+ * @param[in] fp "scontrol show job --json" output.
  * @param[in,out] node_list. A pmix_list_t to add nodes to.
  */
 /* One element of the allocation array: its name, and how many of its cores
@@ -534,26 +534,18 @@ static int prte_ras_slurm_collect_alloc_node(size_t index, json_t *node_obj, voi
                                         cpu_max_count);
 }
 
-int prte_ras_slurm_add_modified_resources(const char *slurm_jobid, pmix_list_t *node_list)
+int prte_ras_slurm_add_modified_resources(FILE *fp, pmix_list_t *node_list)
 {
     prte_ras_slurm_alloc_list_t collected = {NULL, 0, 0};
     int threads_per_core = 1;
-    uint32_t jobid_val;
     int err;
 
-    if(NULL == slurm_jobid || NULL == node_list) {
+    if(NULL == fp || NULL == node_list) {
         PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
         return PRTE_ERR_BAD_PARAM;
     }
 
-    err = prte_ras_slurm_convert_jobid(slurm_jobid, &jobid_val);
-
-    if(PRTE_SUCCESS != err) {
-        PRTE_ERROR_LOG(err);
-        return err;
-    }
-
-    err = prte_ras_slurm_walk_alloc_nodes(slurm_jobid, prte_ras_slurm_collect_alloc_node,
+    err = prte_ras_slurm_walk_alloc_nodes(fp, prte_ras_slurm_collect_alloc_node,
                                           &collected, &threads_per_core);
 
     if(PRTE_SUCCESS == err) {

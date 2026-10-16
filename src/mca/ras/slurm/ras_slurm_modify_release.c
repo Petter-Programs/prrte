@@ -42,7 +42,11 @@ static bool prte_ras_slurm_node_in_argv(char **nodes, const char *node_name);
 static int prte_ras_slurm_count_matching_session_nodes(prte_session_t *session, char **nodes);
 static int prte_ras_slurm_build_survivor_list(prte_session_t *session, char **nodes_to_remove, char ***survivors);
 static void prte_ras_slurm_detach_released_nodes(prte_session_t *session, char **survivor_nodes);
-static int prte_ras_slurm_shrink_job_to_survivors(const char *slurm_jobid, char **survivor_nodes, char *err_msg, size_t err_msg_size);
+static int prte_ras_slurm_shrink_job_to_survivors(prte_ras_slurm_shrink_tracker_t *tracker,
+                                                  const char *slurm_jobid, char **survivor_nodes);
+static void prte_ras_slurm_release_next(prte_ras_slurm_shrink_tracker_t *tracker);
+static void prte_ras_slurm_shrink_job_cb(int status, FILE *out, void *cbdata);
+static void prte_ras_slurm_release_resume(pmix_object_t *cbdata);
 static void prte_ras_slurm_exclude_shrunk_nodes(prte_shrink_campaign_t *campaign);
 
 
@@ -498,92 +502,167 @@ void prte_ras_slurm_drain_session_stack(void)
 int prte_ras_slurm_shrink_complete(prte_shrink_campaign_t *campaign)
 {
     prte_ras_slurm_shrink_tracker_t *found;
-    prte_ras_slurm_release_action_t *action;
 
     found = prte_ras_slurm_find_tracker_by_campaign(campaign);
     if (NULL == found) {
         return PRTE_SUCCESS;
     }
 
+    found->finishing = true;
     prte_ras_slurm_exclude_shrunk_nodes(campaign);
+    prte_ras_slurm_release_next(found);
 
-    PMIX_LIST_FOREACH(action, &found->actions, prte_ras_slurm_release_action_t) {
-        prte_session_stack_item_t *session_item;
-        char err_msg[PRTE_SLURM_ERR_STR_MAX_LEN + 1] = {0};
-        int err;
+    return PRTE_ERR_OP_IN_PROGRESS;
+}
 
-        if (NULL == action->job_id) {
-            continue;
-        }
+/**
+ * @brief Carry out a tracker's first release action.
+ *
+ * @param[in] tracker Tracker whose first action to carry out.
+ *
+ * @return true when a Slurm command was started for it, which continues the
+ *         tracker with prte_ras_slurm_release_resume when it exits.
+ */
+static bool prte_ras_slurm_release_first(prte_ras_slurm_shrink_tracker_t *tracker)
+{
+    prte_ras_slurm_release_action_t *action;
+    prte_session_stack_item_t *session_item;
+    int err;
 
-        session_item = prte_ras_slurm_find_session_item_by_alloc_id(action->job_id);
-        if (NULL == session_item || NULL == session_item->session) {
-            continue;
-        }
+    action = (prte_ras_slurm_release_action_t *) pmix_list_get_first(&tracker->actions);
 
-        if (PRTE_RAS_SLURM_RELEASE_FULL_JOB == action->action) {
-            prte_session_t *session = session_item->session;
-            char *job_id;
-            int node_count = session_item->nodes_in_session;
-
-            if (!prte_ras_slurm_session_is_dynamic(session)) {
-                pmix_output(0, "ras:slurm:shrink_complete: refusing to terminate job %s "
-                               "because it was not dynamically added by PRRTE.",
-                            action->job_id);
-                continue;
-            }
-
-            job_id = strdup(action->job_id);
-            if (NULL == job_id) {
-                PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
-                continue;
-            }
-
-            /* Stop managing the allocation before killing the external Slurm
-             * job. We own ending this allocation's lifecycle, so release
-             * both the stack's reference (via session_item) and the
-             * session's own creation reference. */
-            pmix_list_remove_item(prte_slurm_session_stack, &session_item->super);
-            prte_num_allocated_nodes -= node_count;
-            PMIX_RELEASE(session);
-            PMIX_RELEASE(session_item);
-
-            /* Killing the Slurm job is deliberately the final operation: a
-             * resulting daemon departure cannot race with session teardown. */
-            prte_ras_slurm_kill_job(job_id);
-            free(job_id);
-        } else if (PRTE_RAS_SLURM_RELEASE_PARTIAL_JOB == action->action) {
-            int old_count = session_item->nodes_in_session;
-            int new_count = PMIx_Argv_count(action->survivor_nodes);
-
-            if (0 >= new_count || old_count <= new_count) {
-                continue;
-            }
-
-            err = prte_ras_slurm_shrink_job_to_survivors(action->job_id,
-                                                         action->survivor_nodes,
-                                                         err_msg, sizeof(err_msg));
-            if (PRTE_SUCCESS != err) {
-                if (PRTE_ERR_SLURM_SHRINK_FAILURE == err) {
-                    pmix_output(0, "ras:slurm:shrink_complete: failed to shrink job %s: %s.",
-                                action->job_id, err_msg);
-                } else {
-                    PRTE_ERROR_LOG(err);
-                }
-                continue;
-            }
-
-            prte_ras_slurm_detach_released_nodes(session_item->session,
-                                                 action->survivor_nodes);
-            session_item->nodes_in_session = new_count;
-            prte_num_allocated_nodes -= old_count - new_count;
-        }
+    if (NULL == action->job_id) {
+        return false;
     }
 
-    prte_ras_slurm_untrack_shrink_campaign(found);
-    PMIX_RELEASE(found);
+    session_item = prte_ras_slurm_find_session_item_by_alloc_id(action->job_id);
+    if (NULL == session_item || NULL == session_item->session) {
+        return false;
+    }
 
-    return PRTE_SUCCESS;
+    if (PRTE_RAS_SLURM_RELEASE_FULL_JOB == action->action) {
+        prte_session_t *session = session_item->session;
+        int node_count = session_item->nodes_in_session;
+
+        if (!prte_ras_slurm_session_is_dynamic(session)) {
+            pmix_output(0, "ras:slurm:shrink_complete: refusing to terminate job %s "
+                           "because it was not dynamically added by PRRTE.",
+                        action->job_id);
+            return false;
+        }
+
+        /* Stop managing the allocation before killing the external Slurm
+         * job. We own ending this allocation's lifecycle, so release
+         * both the stack's reference (via session_item) and the
+         * session's own creation reference. */
+        pmix_list_remove_item(prte_slurm_session_stack, &session_item->super);
+        prte_num_allocated_nodes -= node_count;
+        PMIX_RELEASE(session);
+        PMIX_RELEASE(session_item);
+
+        /* Killing the Slurm job is deliberately the final operation: a
+         * resulting daemon departure cannot race with session teardown. */
+        err = prte_ras_slurm_kill_job_then(action->job_id, prte_ras_slurm_release_resume,
+                                           &tracker->super.super);
+        if (PRTE_SUCCESS != err) {
+            PRTE_ERROR_LOG(err);
+            return false;
+        }
+
+        return true;
+    }
+
+    if (PRTE_RAS_SLURM_RELEASE_PARTIAL_JOB == action->action) {
+        int old_count = session_item->nodes_in_session;
+        int new_count = PMIx_Argv_count(action->survivor_nodes);
+
+        if (0 >= new_count || old_count <= new_count) {
+            return false;
+        }
+
+        err = prte_ras_slurm_shrink_job_to_survivors(tracker, action->job_id,
+                                                     action->survivor_nodes);
+        if (PRTE_SUCCESS != err) {
+            PRTE_ERROR_LOG(err);
+            return false;
+        }
+
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * @brief Carry out a tracker's remaining release actions, in order, then
+ * finish its campaign.
+ *
+ * @param[in] tracker Tracker of a completed DVM shrink.
+ */
+static void prte_ras_slurm_release_next(prte_ras_slurm_shrink_tracker_t *tracker)
+{
+    prte_shrink_campaign_t *campaign;
+
+    while (!pmix_list_is_empty(&tracker->actions)) {
+        pmix_list_item_t *action;
+
+        if (prte_ras_slurm_release_first(tracker)) {
+            return;
+        }
+
+        action = pmix_list_remove_first(&tracker->actions);
+        PMIX_RELEASE(action);
+    }
+
+    campaign = tracker->campaign;
+    prte_ras_slurm_untrack_shrink_campaign(tracker);
+    PMIX_RELEASE(tracker);
+    prte_ras_base_shrink_finish(campaign);
+}
+
+/**
+ * @brief Finish a partial release once its scontrol update exits.
+ */
+static void prte_ras_slurm_shrink_job_cb(int status, FILE *out, void *cbdata)
+{
+    prte_ras_slurm_shrink_tracker_t *tracker = (prte_ras_slurm_shrink_tracker_t *) cbdata;
+    prte_ras_slurm_release_action_t *action;
+    prte_session_stack_item_t *session_item;
+
+    action = (prte_ras_slurm_release_action_t *) pmix_list_get_first(&tracker->actions);
+
+    if (!WIFEXITED(status) || 0 != WEXITSTATUS(status)) {
+        char err_msg[PRTE_SLURM_ERR_STR_MAX_LEN + 1];
+
+        if (PRTE_SUCCESS != prte_ras_slurm_drain_cmd_output(out, err_msg, sizeof(err_msg))) {
+            err_msg[0] = '\0';
+        }
+        pmix_output(0, "ras:slurm:shrink_complete: failed to shrink job %s: %s.",
+                    action->job_id, err_msg);
+    } else if (NULL != (session_item = prte_ras_slurm_find_session_item_by_alloc_id(action->job_id)) &&
+               NULL != session_item->session) {
+        int old_count = session_item->nodes_in_session;
+        int new_count = PMIx_Argv_count(action->survivor_nodes);
+
+        prte_ras_slurm_detach_released_nodes(session_item->session, action->survivor_nodes);
+        session_item->nodes_in_session = new_count;
+        prte_num_allocated_nodes -= old_count - new_count;
+    }
+
+    prte_ras_slurm_release_resume(&tracker->super.super);
+}
+
+/**
+ * @brief Drop a tracker's first action, now done, and carry out the rest.
+ */
+static void prte_ras_slurm_release_resume(pmix_object_t *cbdata)
+{
+    prte_ras_slurm_shrink_tracker_t *tracker = (prte_ras_slurm_shrink_tracker_t *) cbdata;
+    pmix_list_item_t *done;
+
+    done = pmix_list_remove_first(&tracker->actions);
+    PMIX_RELEASE(done);
+    prte_ras_slurm_release_next(tracker);
 }
 
 /**
@@ -1348,32 +1427,25 @@ cleanup:
 }
 
 /**
- * @brief Shrink a Slurm job to an exact survivor node list.
+ * @brief Start shrinking a Slurm job to an exact survivor node list.
  *
+ * @param[in] tracker Tracker continued when the command exits.
  * @param[in] slurm_jobid Slurm job ID to resize.
  * @param[in] survivor_nodes Nodes that must remain in the job.
- * @param[out] err_msg Optional buffer for Slurm error output.
- * @param[in] err_msg_size Size of err_msg buffer, if applicable.
  */
-static int prte_ras_slurm_shrink_job_to_survivors(const char *slurm_jobid, char **survivor_nodes,
-                                                  char *err_msg, size_t err_msg_size)
+static int prte_ras_slurm_shrink_job_to_survivors(prte_ras_slurm_shrink_tracker_t *tracker,
+                                                  const char *slurm_jobid, char **survivor_nodes)
 {
     int err = PRTE_SUCCESS;
     char *survivor_string = NULL;
-    char *req_nodes_arg = NULL;
     char *cmd = NULL;
-    FILE *fp = NULL;
     /* With SLURM_JOBID set, scontrol also writes slurm_job_<id>_resize.{sh,csh}
      * into the working directory */
-    static const char *cmd_format = "unset SLURM_JOBID; scontrol update job %s %s 2>&1";
+    static const char *cmd_format = "unset SLURM_JOBID; scontrol update job %s ReqNodeList=%s 2>&1";
 
     if (NULL == slurm_jobid || NULL == survivor_nodes ||
         0 == PMIx_Argv_count(survivor_nodes)) {
         return PRTE_ERR_BAD_PARAM;
-    }
-
-    if (NULL != err_msg) {
-        err_msg[0] = '\0';
     }
 
     err = prte_ras_slurm_validate_jobid(slurm_jobid);
@@ -1393,13 +1465,7 @@ static int prte_ras_slurm_shrink_job_to_survivors(const char *slurm_jobid, char 
         return PRTE_ERR_OUT_OF_RESOURCE;
     }
 
-    if (0 > asprintf(&req_nodes_arg, "ReqNodeList=%s", survivor_string)) {
-        req_nodes_arg = NULL;
-        err = PRTE_ERR_OUT_OF_RESOURCE;
-        goto cleanup;
-    }
-
-    if (0 > asprintf(&cmd, cmd_format, slurm_jobid, req_nodes_arg)) {
+    if (0 > asprintf(&cmd, cmd_format, slurm_jobid, survivor_string)) {
         cmd = NULL;
         err = PRTE_ERR_OUT_OF_RESOURCE;
         goto cleanup;
@@ -1409,42 +1475,10 @@ static int prte_ras_slurm_shrink_job_to_survivors(const char *slurm_jobid, char 
                         "%s ras:slurm:shrink_job: shrink command is:\n%s",
                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), cmd));
 
-    fp = popen(cmd, "r");
-    if (NULL == fp) {
-        err = PRTE_ERR_FILE_OPEN_FAILURE;
-        goto cleanup;
-    }
-
-    err = prte_ras_slurm_drain_cmd_output(fp, err_msg, err_msg_size);
-    if (PRTE_SUCCESS != err) {
-        goto cleanup;
-    }
-
-    int status = pclose(fp);
-    fp = NULL;
-
-    if (-1 == status) {
-        pmix_output(0, "ras:slurm:shrink_job: pclose failed: %s.", strerror(errno));
-        err = PRTE_ERR_IN_ERRNO;
-        goto cleanup;
-    }
-
-    if (!WIFEXITED(status) || 0 != WEXITSTATUS(status)) {
-        err = PRTE_ERR_SLURM_SHRINK_FAILURE;
-        goto cleanup;
-    }
+    err = prte_ras_slurm_run_cmd(cmd, prte_ras_slurm_shrink_job_cb, &tracker->super.super);
 
 cleanup:
-    if (NULL != err_msg && PRTE_ERR_SLURM_SHRINK_FAILURE != err) {
-        err_msg[0] = '\0';
-    }
-
-    if (NULL != fp) {
-        pclose(fp);
-    }
-
     free(survivor_string);
-    free(req_nodes_arg);
     free(cmd);
 
     return err;

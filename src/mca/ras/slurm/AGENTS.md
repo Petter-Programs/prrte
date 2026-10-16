@@ -87,13 +87,17 @@ deviation* and the framework guide.
   threads-per-core, per-node GRES, reservation, node features, excluded
   nodes, and the memory and per-GPU options read as described below — each
   gated by a `propagate_*` MCA param, all default true), builds `salloc`
-  args, launches an **expander job**, waits for its `salloc` to exit, trims
-  its time limit to the parent's end, then adds the modified resources.
+  args, launches an **expander job**, waits for its `salloc` to exit, adds
+  the modified resources, and trims the job's time limit to the parent's end.
   Answers in two phases — see below.
 - **`PMIX_ALLOC_NEW`** → the same request; see below.
 - **`PMIX_ALLOC_RELEASE`** → `serve_release_req`: shrinks the SLURM job
   with `scontrol update job`, removing nodes by count or by name while
-  protecting the node the HNP is running on.
+  protecting the node the HNP is running on. `shrink_complete` runs the
+  tracker's actions one at a time, waiting for each `scontrol update` or
+  `scancel`, and answers `PRTE_ERR_OP_IN_PROGRESS`, so phase two waits for
+  Slurm; the tracker stays active until then, which keeps a second release of
+  the same job out. From then on the tracker owns the campaign.
 - **`PMIX_ALLOC_REQ_CANCEL`** → `serve_cancel_req`: cancels a pending
   extend by request id, and answers it (see below).
 
@@ -202,7 +206,8 @@ counts a limit from the job's own start, which a queued job does not have yet.
   under a minute becomes one minute.
 - **Neither step failing fails the extend.** A generous request is still a
   valid one, granted nodes are usable, and the limit is site policy; both
-  report and carry on.
+  report and carry on. The extend does not wait for the trim either: it
+  starts at the grant and runs its two commands on its own.
 - Only the trim is clock-safe: the submit step compares Slurm's end time
   against the local clock.
 - Both are gated by `ras_slurm_propagate_time`.
@@ -264,13 +269,21 @@ check, and **nothing polls a queued job**.
 - **`slurm_grant_check_cb` retries, boundedly.** It closes a gap of
   milliseconds before slurmctld reports the outcome, not a queue wait.
   Exhausting the budget fails the request and `scancel`s the job.
+- **One record answers both questions.** The `scontrol show job` that says
+  the job is running also lists its nodes, so `add_modified_resources` reads
+  the same output, rewound.
 - **Child and extend are linked by an index and a job ID, never a reference.**
   Either can outlive the other.
 - **A cancelled extend is answered by whoever cancelled it.** `serve_cancel_req`
   calls `prte_ras_slurm_extend_abort_request` after `cancel_pending_req`, in
   that order so the completion finds no record and does not `scancel` twice.
+  An extend still reading its parent's record has no record yet; the abort
+  alone stops it, since each step checks `completing` before going on.
   Not from `cancel_pending_req` — the completion path calls that, and it would
   recurse.
+- **Only the extend that added a pending record removes or cancels it**
+  (`pending_added`). A request id is the client's, so two extends can share
+  one.
 
 ### Slurm commands never block the HNP
 
@@ -377,7 +390,8 @@ Slurm prints every socket and every core of every allocated node, so a
 record grows with the total core count of the job's nodes: on a 10k-node DVM
 it is hundreds of megabytes, and several times that again as a jansson DOM.
 
-`prte_ras_slurm_json_run` therefore walks the record with
+`prte_ras_slurm_json_run` therefore walks the record, as the command runner
+captured it, with
 `src/util/prte_json_window.c` through a fixed 1MB window
 (`PRTE_SLURM_JSON_WINDOW_SIZE`). The walker knows nothing about JSON beyond
 the punctuation between values: it hands this file the bytes of a member it
@@ -395,9 +409,7 @@ holds. `gres_detail` carries one string per node and arrives *before*
 `job_resources`, so discarding only the member known to be large would have
 left that one in memory.
 
-Two consequences worth knowing. The record is always drained, so `scontrol`
-exits on its own terms and its status means what it says. And
-`threads_per_core` is a member of the job that Slurm prints *after* the node
+One consequence worth knowing: `threads_per_core` is a member of the job that Slurm prints *after* the node
 array, which is why `add_modified_resources` settles slot counts once the
 walk returns rather than inside it.
 

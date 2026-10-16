@@ -18,6 +18,7 @@
 #include "prte_config.h"
 
 #include <stdint.h>
+#include <stdio.h>
 
 #if PRTE_TESTBUILD_LAUNCHERS
 #    include "src/mca/ras/base/testbuild_jansson.h"
@@ -49,15 +50,14 @@ int prte_ras_slurm_json_load(prte_json_window_t *win, const char *what, json_t *
 /* Keep the members named in a prte_ras_slurm_json_keep_t and skip the rest. */
 int prte_ras_slurm_json_keep_member(prte_json_window_t *win, const char *key, void *cbdata);
 
-/* Run "scontrol show job" and hand each member of the job it names to
+/* Hand each member of the job in "scontrol show job --json" output to
  * job_handler. */
-int prte_ras_slurm_json_run(const char *slurm_jobid,
-                            prte_json_window_member_fn_t job_handler, void *job_cbdata);
+int prte_ras_slurm_json_run(FILE *fp, prte_json_window_member_fn_t job_handler,
+                            void *job_cbdata);
 
 /* Read the named members of a job's record into an object the caller
  * decrefs. */
-int prte_ras_slurm_read_job_fields(const char *slurm_jobid, const char *const *keys,
-                                   json_t **job_info_out);
+int prte_ras_slurm_read_job_fields(FILE *fp, const char *const *keys, json_t **job_info_out);
 
 /* Read one Slurm numeric object out of a job record. Absent, unset and
  * infinite all read back as 0. */
