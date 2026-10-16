@@ -10,7 +10,7 @@
  */
 
 /* A job's allocated nodes: the walk down to
- * job_resources.nodes.allocation, and the two callers that consume it. */
+ * job_resources.nodes.allocation, and the caller that consumes it. */
 
 #include "prte_config.h"
 #include "constants.h"
@@ -60,15 +60,12 @@
  *     nodes_member      takes count, walks allocation
  *     alloc_element     parses one node and hands it to node_cb
  *
- * count_cb runs once with the count, before the first node, and may refuse.
  * node_cb runs once per node with that node's record, which is released as
  * soon as it returns.
  */
-typedef int (*prte_ras_slurm_alloc_count_fn_t)(size_t node_count, void *cbdata);
 typedef int (*prte_ras_slurm_alloc_node_fn_t)(size_t index, json_t *node_obj, void *cbdata);
 
 typedef struct {
-    prte_ras_slurm_alloc_count_fn_t count_cb;
     prte_ras_slurm_alloc_node_fn_t node_cb;
     void *cbdata;
     prte_ras_slurm_json_keep_t keep;
@@ -96,11 +93,8 @@ static int prte_ras_slurm_json_alloc_element(prte_json_window_t *win, size_t ind
 }
 
 /*
- * Take the count Slurm states for the array.
- *
- * This is the only thing that lets a caller size anything up front. It is
- * Slurm's claim about the array and not a fact about it, so the walk checks
- * it against the elements it actually reads.
+ * Take the count Slurm states for the array. The walk checks it against the
+ * elements it actually reads.
  */
 static int prte_ras_slurm_json_take_node_count(prte_json_window_t *win,
                                                prte_ras_slurm_alloc_walk_t *walk)
@@ -129,10 +123,6 @@ static int prte_ras_slurm_json_take_node_count(prte_json_window_t *win,
     walk->have_count = true;
     json_decref(value);
 
-    if (NULL != walk->count_cb) {
-        return walk->count_cb(walk->stated, walk->cbdata);
-    }
-
     return PRTE_SUCCESS;
 }
 
@@ -141,12 +131,6 @@ static int prte_ras_slurm_json_walk_allocation(prte_json_window_t *win,
                                                prte_ras_slurm_alloc_walk_t *walk)
 {
     if (walk->seen_allocation) {
-        return PRTE_ERR_JSON_PARSE_FAILURE;
-    }
-
-    /* A caller that sizes something from the count needs it before the first
-     * element, and Slurm prints it first. */
-    if (NULL != walk->count_cb && !walk->have_count) {
         return PRTE_ERR_JSON_PARSE_FAILURE;
     }
 
@@ -200,22 +184,19 @@ static int prte_ras_slurm_json_job_nodes_member(prte_json_window_t *win, const c
  * Report a job's allocated nodes without holding its record.
  *
  * Each node's record is handed to node_cb and released before the next is
- * read, so the cost is one node rather than the job. count_cb, where given,
- * runs first with the count Slurm states, and the array is then required to
- * hold exactly that many.
+ * read, so the cost is one node rather than the job. Where Slurm states a
+ * count, the array is required to hold exactly that many.
  *
  * threads_per_core is a member of the job rather than of a node, and Slurm
  * prints it after the array, so it is only settled once this returns. It
  * reads back as 1 where the record leaves it unset or infinite.
  *
  * @param[in]  slurm_jobid       Slurm job ID to query.
- * @param[in]  count_cb          called once with nodes/count; may be NULL.
  * @param[in]  node_cb           called once per allocated node.
- * @param[in]  cbdata            passed to both callbacks.
+ * @param[in]  cbdata            passed to node_cb.
  * @param[out] threads_per_core  the job's threads_per_core; may be NULL.
  */
 static int prte_ras_slurm_walk_alloc_nodes(const char *slurm_jobid,
-                                           prte_ras_slurm_alloc_count_fn_t count_cb,
                                            prte_ras_slurm_alloc_node_fn_t node_cb, void *cbdata,
                                            int *threads_per_core)
 {
@@ -230,7 +211,6 @@ static int prte_ras_slurm_walk_alloc_nodes(const char *slurm_jobid,
         return PRTE_ERR_BAD_PARAM;
     }
 
-    walk.count_cb = count_cb;
     walk.node_cb = node_cb;
     walk.cbdata = cbdata;
     walk.keep.keys = keys;
@@ -573,7 +553,7 @@ int prte_ras_slurm_add_modified_resources(const char *slurm_jobid, pmix_list_t *
         return err;
     }
 
-    err = prte_ras_slurm_walk_alloc_nodes(slurm_jobid, NULL, prte_ras_slurm_collect_alloc_node,
+    err = prte_ras_slurm_walk_alloc_nodes(slurm_jobid, prte_ras_slurm_collect_alloc_node,
                                           &collected, &threads_per_core);
 
     if(PRTE_SUCCESS == err) {
@@ -581,170 +561,6 @@ int prte_ras_slurm_add_modified_resources(const char *slurm_jobid, pmix_list_t *
     }
 
     prte_ras_slurm_alloc_list_destruct(&collected);
-
-    return err;
-}
-
-/**
- * Synchronize a session's node list with a reduced Slurm allocation.
- *
- * Nodes no longer present in the allocation are appended to
- * removed_nodes.
- *
- * @param[in] slurm_jobid Slurm job identifier.
- * @param[in,out] session Session to update.
- * @param[out] removed_nodes Receives detached nodes; must be empty.
- */
-/* The session's nodes, and which of them the record still lists. */
-typedef struct {
-    pmix_pointer_array_t *matched;
-    pmix_pointer_array_t *unmatched;
-    size_t session_nodes;
-} prte_ras_slurm_detach_t;
-
-static int prte_ras_slurm_detach_count(size_t node_count, void *cbdata)
-{
-    prte_ras_slurm_detach_t *detach = (prte_ras_slurm_detach_t *) cbdata;
-
-    /* Sanity checks the matching below relies on. Slurm states this count
-     * ahead of the nodes themselves, and the walk holds the list to it. */
-    if (0 == node_count || 0 == detach->session_nodes || node_count >= detach->session_nodes) {
-        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
-        return PRTE_ERR_BAD_PARAM;
-    }
-
-    return PRTE_SUCCESS;
-}
-
-static int prte_ras_slurm_detach_node(size_t index, json_t *node_obj, void *cbdata)
-{
-    prte_ras_slurm_detach_t *detach = (prte_ras_slurm_detach_t *) cbdata;
-    const char *nodename_string;
-    json_t *nodename;
-    int session_node_idx;
-    int err;
-    int j;
-
-    if (!json_is_object(node_obj)) {
-        err = PRTE_ERR_JSON_PARSE_FAILURE;
-        PRTE_ERROR_LOG(err);
-        return err;
-    }
-
-    nodename = json_object_get(node_obj, "name");
-
-    if (NULL == nodename || !json_is_string(nodename)) {
-        err = PRTE_ERR_JSON_PARSE_FAILURE;
-        PRTE_ERROR_LOG(err);
-        return err;
-    }
-
-    nodename_string = json_string_value(nodename);
-
-    if (NULL == nodename_string || '\0' == nodename_string[0]) {
-        err = PRTE_ERR_JSON_PARSE_FAILURE;
-        PRTE_ERROR_LOG(err);
-        return err;
-    }
-
-    session_node_idx = (int) index;
-
-    /* find the equivalent node in the list of unmatched nodes.
-     * We expect (but do not strictly require) the ordering here
-     * to be favorable; i.e. node at index i should be the
-     * one we are looking for */
-    for (j = 0; j < detach->unmatched->size; j++) {
-        prte_node_t *curr = (prte_node_t *) pmix_pointer_array_get_item(detach->unmatched,
-                                                                        session_node_idx);
-
-        if (NULL != curr && NULL != curr->name && 0 == strcmp(curr->name, nodename_string)) {
-            pmix_pointer_array_add(detach->matched, curr);
-            pmix_pointer_array_set_item(detach->unmatched, session_node_idx, NULL);
-            return PRTE_SUCCESS;
-        }
-
-        if (++session_node_idx >= detach->unmatched->size) {
-            session_node_idx = 0;
-        }
-    }
-
-    err = PRTE_ERR_NOT_FOUND;
-    PRTE_ERROR_LOG(err);
-    return err;
-}
-
-int prte_ras_slurm_detach_nodes(const char *slurm_jobid, prte_session_t *session, pmix_pointer_array_t *removed_nodes)
-{
-    pmix_pointer_array_t matched_nodes, unmatched_nodes;
-    prte_ras_slurm_detach_t detach;
-    int err;
-    int i;
-
-    if (NULL == slurm_jobid || NULL == removed_nodes ||
-        NULL == session || NULL == session->nodes ||
-        0 != removed_nodes->size) {
-        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
-        return PRTE_ERR_BAD_PARAM;
-    }
-
-    err = prte_ras_slurm_validate_jobid(slurm_jobid);
-
-    if(PRTE_SUCCESS != err) {
-        PRTE_ERROR_LOG(err);
-        return err;
-    }
-
-    PMIX_CONSTRUCT(&matched_nodes, pmix_pointer_array_t);
-    PMIX_CONSTRUCT(&unmatched_nodes, pmix_pointer_array_t);
-
-    detach.matched = &matched_nodes;
-    detach.unmatched = &unmatched_nodes;
-    detach.session_nodes = 0;
-
-    /* Built before the record is read, so the count Slurm states can be
-     * judged the moment it arrives. */
-    for (i = 0; i < session->nodes->size; i++) {
-        prte_node_t *node_ptr = (prte_node_t *)pmix_pointer_array_get_item(session->nodes, i);
-
-        if (NULL != node_ptr) {
-            pmix_pointer_array_add(&unmatched_nodes, node_ptr);
-            detach.session_nodes++;
-        }
-    }
-
-    err = prte_ras_slurm_walk_alloc_nodes(slurm_jobid, prte_ras_slurm_detach_count,
-                                          prte_ras_slurm_detach_node, &detach, NULL);
-
-    if(PRTE_SUCCESS != err) {
-        goto cleanup;
-    }
-
-    /* success, clear out old entries and reconstruct the node list*/
-
-    pmix_pointer_array_remove_all(session->nodes);
-
-    for (i = 0; i < matched_nodes.size; i++) {
-        prte_node_t *curr = (prte_node_t *)pmix_pointer_array_get_item(&matched_nodes, i);
-        if(NULL != curr) {
-            pmix_pointer_array_set_item(session->nodes, i, curr);
-        }
-    }
-
-    pmix_pointer_array_remove_all(&matched_nodes);
-
-    for (i = 0; i < unmatched_nodes.size; i++) {
-        prte_node_t *curr = (prte_node_t *)pmix_pointer_array_get_item(&unmatched_nodes, i);
-        if(NULL != curr) {
-            pmix_pointer_array_add(removed_nodes, curr);
-        }
-    }
-
-    pmix_pointer_array_remove_all(&unmatched_nodes);
-
-cleanup:
-
-    PMIX_DESTRUCT(&matched_nodes);
-    PMIX_DESTRUCT(&unmatched_nodes);
 
     return err;
 }

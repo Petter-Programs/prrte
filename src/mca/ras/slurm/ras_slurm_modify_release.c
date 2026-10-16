@@ -41,6 +41,7 @@ static prte_session_stack_item_t *prte_ras_slurm_find_session_item_by_node(const
 static bool prte_ras_slurm_node_in_argv(char **nodes, const char *node_name);
 static int prte_ras_slurm_count_matching_session_nodes(prte_session_t *session, char **nodes);
 static int prte_ras_slurm_build_survivor_list(prte_session_t *session, char **nodes_to_remove, char ***survivors);
+static void prte_ras_slurm_detach_released_nodes(prte_session_t *session, char **survivor_nodes);
 static int prte_ras_slurm_shrink_job_to_survivors(const char *slurm_jobid, char **survivor_nodes, char *err_msg, size_t err_msg_size);
 static void prte_ras_slurm_exclude_shrunk_nodes(prte_shrink_campaign_t *campaign);
 
@@ -567,7 +568,6 @@ void prte_ras_slurm_shrink_complete(prte_shrink_campaign_t *campaign)
             }
             free(job_id);
         } else if (PRTE_RAS_SLURM_RELEASE_PARTIAL_JOB == action->action) {
-            pmix_pointer_array_t nodes_in_removal;
             int old_count = session_item->nodes_in_session;
             int new_count = PMIx_Argv_count(action->survivor_nodes);
 
@@ -588,28 +588,8 @@ void prte_ras_slurm_shrink_complete(prte_shrink_campaign_t *campaign)
                 continue;
             }
 
-            PMIX_CONSTRUCT(&nodes_in_removal, pmix_pointer_array_t);
-            err = prte_ras_slurm_detach_nodes(action->job_id, session_item->session,
-                                              &nodes_in_removal);
-            /* detach_nodes hands back the nodes it dropped from
-             * session->nodes, each still carrying the reference the session
-             * took in assign_new_session. Destructing the array does not
-             * release them, so drop those references here or the node
-             * objects are never reclaimed. */
-            for (int k = 0; k < nodes_in_removal.size; k++) {
-                prte_node_t *gone = (prte_node_t *)
-                    pmix_pointer_array_get_item(&nodes_in_removal, k);
-                if (NULL != gone) {
-                    pmix_pointer_array_set_item(&nodes_in_removal, k, NULL);
-                    PMIX_RELEASE(gone);
-                }
-            }
-            PMIX_DESTRUCT(&nodes_in_removal);
-            if (PRTE_SUCCESS != err) {
-                PRTE_ERROR_LOG(err);
-                continue;
-            }
-
+            prte_ras_slurm_detach_released_nodes(session_item->session,
+                                                 action->survivor_nodes);
             session_item->nodes_in_session = new_count;
             prte_num_allocated_nodes -= old_count - new_count;
         }
@@ -862,6 +842,38 @@ static int prte_ras_slurm_count_matching_session_nodes(prte_session_t *session, 
     }
 
     return matches;
+}
+
+/**
+ * @brief Drop the nodes a shrink released from a session, keeping the
+ * survivors in order.
+ *
+ * A successful scontrol update ReqNodeList=<survivors> leaves the job with
+ * exactly those nodes.
+ *
+ * @param[in,out] session Session to update.
+ * @param[in] survivor_nodes Nodes the Slurm job still holds.
+ */
+static void prte_ras_slurm_detach_released_nodes(prte_session_t *session, char **survivor_nodes)
+{
+    int kept = 0;
+
+    for (int i = 0; i < session->nodes->size; i++) {
+        prte_node_t *node = (prte_node_t *) pmix_pointer_array_get_item(session->nodes, i);
+
+        if (NULL == node) {
+            continue;
+        }
+
+        pmix_pointer_array_set_item(session->nodes, i, NULL);
+
+        if (prte_ras_slurm_node_in_argv(survivor_nodes, node->name)) {
+            pmix_pointer_array_set_item(session->nodes, kept++, node);
+        } else {
+            /* The reference assign_new_session took */
+            PMIX_RELEASE(node);
+        }
+    }
 }
 
 /**

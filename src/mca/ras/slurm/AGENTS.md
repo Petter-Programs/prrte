@@ -26,7 +26,7 @@ Files:
 | `ras_slurm_modify_cancel.c` | `PMIX_ALLOC_REQ_CANCEL`: track and cancel pending extend requests. |
 | `ras_slurm_modify_common.c` | Shared helpers: `kill_job`, control-char checks, command-output draining. |
 | `ras_slurm_jansson.c` | JSON path: reads a record through a fixed window; knows nothing of its shape past `jobs[0]`. |
-| `ras_slurm_jansson_nodes.c` | Walks `job_resources.nodes.allocation`, with the two readers that consume it. |
+| `ras_slurm_jansson_nodes.c` | Walks `job_resources.nodes.allocation` for `add_modified_resources`. |
 | `ras_slurm_jansson_fields.c` | Reads the top-level fields, the job state and the job's times. |
 | `ras_slurm_jansson.h` | What those three share. |
 | `ras_slurm_jansson_stub.c` | No-Jansson stubs so the component builds without the JSON parser. |
@@ -468,12 +468,10 @@ rules are easy to get wrong and the failures are silent leaks.
   (`assign_new_session` does `PMIX_RETAIN` before
   `pmix_pointer_array_add`). Anything that removes a node from that array
   must release it.
-- **`prte_ras_slurm_detach_nodes` hands the dropped nodes back through
-  its `removed_nodes` out-parameter and does NOT release them.** That
-  parameter exists precisely so the caller can. `PMIX_DESTRUCT` on a
-  `pmix_pointer_array_t` frees the array, never its items — destructing
-  it without releasing first leaks one reference per detached node on
-  every partial shrink.
+- **A partial shrink detaches nodes from the survivor list it sent.**
+  A successful `scontrol update ... ReqNodeList=` leaves the job with
+  exactly those nodes, so the job record is not read again.
+  `detach_released_nodes` releases each node it drops.
 - **`prte_slurm_session_stack` retains a reference on each session it
   holds** (released automatically by `prte_session_stack_item_t`'s
   destructor), independent of the session's own creation reference —
