@@ -504,14 +504,14 @@ void prte_ras_slurm_drain_session_stack(void)
  *
  * @param[in] campaign Completed shrink campaign.
  */
-void prte_ras_slurm_shrink_complete(prte_shrink_campaign_t *campaign)
+int prte_ras_slurm_shrink_complete(prte_shrink_campaign_t *campaign)
 {
     prte_ras_slurm_shrink_tracker_t *found;
     prte_ras_slurm_release_action_t *action;
 
     found = prte_ras_slurm_find_tracker_by_campaign(campaign);
     if (NULL == found) {
-        return;
+        return PRTE_SUCCESS;
     }
 
     prte_ras_slurm_exclude_shrunk_nodes(campaign);
@@ -597,6 +597,8 @@ void prte_ras_slurm_shrink_complete(prte_shrink_campaign_t *campaign)
 
     prte_ras_slurm_untrack_shrink_campaign(found);
     PMIX_RELEASE(found);
+
+    return PRTE_SUCCESS;
 }
 
 /**

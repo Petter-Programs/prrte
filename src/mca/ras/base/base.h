@@ -119,6 +119,11 @@ PRTE_EXPORT void prte_ras_base_flush_deferred_releases(pmix_status_t status);
  * provides one. */
 PRTE_EXPORT void prte_ras_base_shrink_complete(prte_shrink_campaign_t *campaign);
 
+/* Tell the requester a shrink campaign is complete and release it. Called by
+ * prte_ras_base_shrink_complete, or later by a module whose shrink_complete
+ * answered PRTE_ERR_OP_IN_PROGRESS. */
+PRTE_EXPORT void prte_ras_base_shrink_finish(prte_shrink_campaign_t *campaign);
+
 PRTE_EXPORT void prte_ras_base_release_allocation(prte_session_t *session);
 
 /* Tear down a reservation: drop its hold on its nodes (clearing the

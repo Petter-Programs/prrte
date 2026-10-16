@@ -97,8 +97,11 @@ typedef pmix_status_t (*prte_ras_base_module_modify_fn_t)(prte_pmix_server_req_t
  * module can release the freed resources back to the scheduler. The
  * campaign object is passed so the module can identify which shrink
  * completed.
+ *
+ * Returns PRTE_SUCCESS when done, or PRTE_ERR_OP_IN_PROGRESS when the module
+ * will call prte_ras_base_shrink_finish(campaign) itself once it is.
  */
-typedef void (*prte_ras_base_module_shrink_complete_fn_t)(prte_shrink_campaign_t *campaign);
+typedef int (*prte_ras_base_module_shrink_complete_fn_t)(prte_shrink_campaign_t *campaign);
 
 /**
  * Release an allocation associated with the given session.
@@ -161,7 +164,7 @@ typedef pmix_mca_base_component_t prte_ras_base_component_t;
  * Bump it on any change to the module interface that a component built
  * against the previous one would not survive. */
 #define PRTE_MCA_ras_MAJOR_VERSION   2
-#define PRTE_MCA_ras_MINOR_VERSION   1
+#define PRTE_MCA_ras_MINOR_VERSION   2
 #define PRTE_MCA_ras_RELEASE_VERSION 0
 
 END_C_DECLS

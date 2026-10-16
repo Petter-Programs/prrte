@@ -91,7 +91,7 @@ points; only `allocate` is universally implemented:
 typedef int (*prte_ras_base_module_init_fn_t)(void);
 typedef int (*prte_ras_base_module_allocate_fn_t)(prte_job_t *jdata, pmix_list_t *nodes);
 typedef pmix_status_t (*prte_ras_base_module_modify_fn_t)(prte_pmix_server_req_t *req);
-typedef void (*prte_ras_base_module_shrink_complete_fn_t)(prte_shrink_campaign_t *campaign);
+typedef int (*prte_ras_base_module_shrink_complete_fn_t)(prte_shrink_campaign_t *campaign);
 typedef int (*prte_ras_base_module_release_fn_t)(prte_session_t *session);
 typedef int (*prte_ras_base_module_finalize_fn_t)(void);
 ```
@@ -101,7 +101,7 @@ typedef int (*prte_ras_base_module_finalize_fn_t)(void);
 | `init` | Optional one-time setup at selection (SLURM allocates its session stack here; most components leave it NULL). |
 | `allocate` | Discover nodes and **append `prte_node_t` objects to `nodes`** (a `pmix_list_t`). Does *not* touch the global pool — the base does that. |
 | `modify` | Serve a runtime allocation change (`PMIX_ALLOC_NEW`/`EXTEND`/`RELEASE`/`REQ_CANCEL`) carried in a `prte_pmix_server_req_t`. |
-| `shrink_complete` | Called once an elastic shrink campaign has drained, so the RM can hand freed nodes back to the scheduler. |
+| `shrink_complete` | Called once an elastic shrink campaign has drained, so the RM can hand freed nodes back to the scheduler. Returns `PRTE_ERR_OP_IN_PROGRESS` to finish later through `prte_ras_base_shrink_finish()`, which sends the requester's phase two. |
 | `release_allocation` | Called when a `prte_session_t` is destructed, so the RM can release that session's allocation. |
 | `finalize` | Teardown at framework close. |
 
@@ -533,7 +533,7 @@ elastic-DVM or PMIx_Allocation code:
 | `prte_ras_base_activate_nodes()` | Resolve one activation — a host specification, a hostfile, or both — against the node pool and mark the resolved entries `PRTE_NODE_STATE_ADDED`, reporting how many entries that changed. Shared by `--activate` and `PMIX_ALLOC_ACTIVATE`. Resolves and marks only: activating the grow is the caller's. |
 | `prte_ras_base_complete_request()` | The heavy reservation router. For `PMIX_ALLOC_NEW`/`EXTEND` it resolves the destination `prte_session_t` (honoring `PMIX_ALLOC_TARGET`/`SHARE`/`INHERITANCE`/`ID`/`REQ_ID`), parses `PMIX_ALLOC_NODE_LIST`, inserts the nodes, and attaches them to the reservation (`add_nodes_to_session`). For `PMIX_ALLOC_RELEASE` it tears down a named reservation or xcasts a `PRTE_DAEMON_SHRINK_CMD`. Marks `PRTE_JOB_EXTEND_DVM` and re-launches daemons for grows. |
 | `prte_ras_base_release_allocation()` | Session-destruct hook: cycles modules whose `release_allocation` matches `session->alloc_module`. |
-| `prte_ras_base_shrink_complete()` | Offers a drained `prte_shrink_campaign_t` to every module's `shrink_complete`. |
+| `prte_ras_base_shrink_complete()` | Offers a drained `prte_shrink_campaign_t` to every module's `shrink_complete`, then calls `prte_ras_base_shrink_finish()` unless a module deferred it. The campaign is already off `prte_shrink_campaigns`, so launches are not held while a module finishes. |
 | `prte_ras_base_teardown_reservation()` | Drop a reservation's hold on its nodes (clear `node->session` back to the default pool), deregister it, release the registry's reference on it, and — if `return_to_scheduler` — shrink its daemon-carrying nodes out of the DVM. |
 | `prte_ras_base_check_reservations_on_term()` | On namespace termination, fire each reservation's inheritance disposition (`PMIX_ALLOC_INHERIT_NONE`/`CHILD`/`CHILD_DEFAULT`/`DEFAULT`). |
 

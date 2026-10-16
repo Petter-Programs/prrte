@@ -1058,16 +1058,32 @@ respond:
 void prte_ras_base_shrink_complete(prte_shrink_campaign_t *campaign)
 {
     prte_ras_base_selected_module_t *mod;
+    bool deferred = false;
 
     /* cycle across the active modules and give each that supports the
      * entry point a chance to release the freed resources back to the
      * scheduler. Unlike modify, a shrink completion is not keyed to a
-     * single component, so every module is offered the campaign. */
+     * single component, so every module is offered the campaign. There is
+     * one selected module, so at most one defers. */
     PMIX_LIST_FOREACH(mod, &prte_ras_base.selected_modules, prte_ras_base_selected_module_t) {
-        if (NULL != mod->module->shrink_complete) {
-            mod->module->shrink_complete(campaign);
+        if (NULL != mod->module->shrink_complete &&
+            PRTE_ERR_OP_IN_PROGRESS == mod->module->shrink_complete(campaign)) {
+            deferred = true;
         }
     }
+
+    if (!deferred) {
+        prte_ras_base_shrink_finish(campaign);
+    }
+}
+
+void prte_ras_base_shrink_finish(prte_shrink_campaign_t *campaign)
+{
+    if (campaign->have_requester) {
+        prte_plm_base_dvm_mod_notify(&campaign->requester, campaign->alloc_id,
+                                     campaign->req_id, true, PMIX_SUCCESS);
+    }
+    PMIX_RELEASE(campaign);
 }
 
 /* Report the application procs killed by the release of this node.  Nothing
@@ -1193,20 +1209,17 @@ static void shrink_campaign_complete(int sd, short args, void *cbdata)
         }
     }
 
-    /* the campaign has drained: drop the fence it raised, give the RAS modules
-     * their release hook, tell the requester the DVM now reflects the new size,
-     * and release any jobs held behind the fence once it reaches zero. */
+    /* the campaign has drained: drop the fence it raised and take it off the
+     * list that holds launches, then give the RAS modules their release hook,
+     * which tells the requester the DVM now reflects the new size, and release
+     * any jobs held behind the fence once it reaches zero. A module may tell
+     * the requester later, after the campaign has left the list. */
     prte_dvm_launch_fence -= camp->pending;
-    prte_ras_base_shrink_complete(camp);
-    if (camp->have_requester) {
-        prte_plm_base_dvm_mod_notify(&camp->requester, camp->alloc_id,
-                                     camp->req_id, true, PMIX_SUCCESS);
-    }
     pmix_list_remove_item(&prte_shrink_campaigns, &camp->super);
+    prte_ras_base_shrink_complete(camp);
     if (0 == prte_dvm_launch_fence) {
         prte_plm_base_fence_release();
     }
-    PMIX_RELEASE(camp);
 }
 
 /* grpcomm xcast-completion callback: fires on the master, inside the xcast call
