@@ -1347,12 +1347,15 @@ elastic_grant_group() {
     [ "$(job_nodes "$ajid")" = "${nodes##*,}" ] \
         && ok "the job kept exactly the node PRRTE named as survivor" \
         || bad "job $ajid holds $(job_nodes "$ajid"), expected ${nodes##*,}"
-    # SLURM writes slurm_job_<id>_resize.{sh,csh} into the caller's cwd on a
-    # successful shrink for the user to source; PRRTE deletes them.  Their
-    # absence only means anything because the resize above really happened.
-    [ -z "$(SA 'find / -maxdepth 2 -name "slurm_job_*_resize.*" 2>/dev/null')" ] \
-        && ok "the resize helper scripts SLURM left behind were cleaned up" \
-        || bad "slurm_job_*_resize.* left behind after a shrink"
+    # A successful shrink writes slurm_job_<id>_resize.{sh,csh} into the
+    # caller's cwd when SLURM_JOBID is set; PRRTE unsets it for the resize.
+    if [ "$n" = 1 ]; then
+        [ -z "$(SA 'find / -maxdepth 2 -name "slurm_job_*_resize.*" 2>/dev/null')" ] \
+            && ok "the resize wrote no helper scripts" \
+            || bad "slurm_job_*_resize.* left behind after a shrink"
+    else
+        skp "no resize happened, so the helper-script check has nothing to test"
+    fi
 
     banner "ras/slurm: releasing a whole allocation scancels its SLURM job"
     out=$(SA "timeout 180 elastic release-id $ajid" 2>&1)

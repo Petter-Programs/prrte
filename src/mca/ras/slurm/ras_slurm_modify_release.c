@@ -42,7 +42,6 @@ static bool prte_ras_slurm_node_in_argv(char **nodes, const char *node_name);
 static int prte_ras_slurm_count_matching_session_nodes(prte_session_t *session, char **nodes);
 static int prte_ras_slurm_build_survivor_list(prte_session_t *session, char **nodes_to_remove, char ***survivors);
 static int prte_ras_slurm_shrink_job_to_survivors(const char *slurm_jobid, char **survivor_nodes, char *err_msg, size_t err_msg_size);
-static void prte_ras_slurm_cleanup_resize_scripts(const char *slurm_jobid);
 static void prte_ras_slurm_exclude_shrunk_nodes(prte_shrink_campaign_t *campaign);
 
 
@@ -1349,42 +1348,6 @@ cleanup:
     return err;
 }
 
-static void prte_ras_slurm_cleanup_resize_scripts(const char *slurm_jobid)
-{
-    char *resize_script_sh = NULL;
-    char *resize_script_csh = NULL;
-    static const char *resize_script_format = "slurm_job_%s_resize.%s";
-
-    if (NULL == slurm_jobid) {
-        return;
-    }
-
-    if (0 <= asprintf(&resize_script_sh, resize_script_format, slurm_jobid, "sh")) {
-        if (0 != remove(resize_script_sh)) {
-            int saved_errno = errno;
-            if (ENOENT != saved_errno) {
-                pmix_output(0,
-                            "ras:slurm:shrink_job: failed to remove helper script %s: %s.",
-                            resize_script_sh, strerror(saved_errno));
-            }
-        }
-    }
-
-    if (0 <= asprintf(&resize_script_csh, resize_script_format, slurm_jobid, "csh")) {
-        if (0 != remove(resize_script_csh)) {
-            int saved_errno = errno;
-            if (ENOENT != saved_errno) {
-                pmix_output(0,
-                            "ras:slurm:shrink_job: failed to remove helper script %s: %s.",
-                            resize_script_csh, strerror(saved_errno));
-            }
-        }
-    }
-
-    free(resize_script_sh);
-    free(resize_script_csh);
-}
-
 /**
  * @brief Shrink a Slurm job to an exact survivor node list.
  *
@@ -1401,7 +1364,9 @@ static int prte_ras_slurm_shrink_job_to_survivors(const char *slurm_jobid, char 
     char *req_nodes_arg = NULL;
     char *cmd = NULL;
     FILE *fp = NULL;
-    static const char *cmd_format = "scontrol update job %s %s 2>&1";
+    /* With SLURM_JOBID set, scontrol also writes slurm_job_<id>_resize.{sh,csh}
+     * into the working directory */
+    static const char *cmd_format = "unset SLURM_JOBID; scontrol update job %s %s 2>&1";
 
     if (NULL == slurm_jobid || NULL == survivor_nodes ||
         0 == PMIx_Argv_count(survivor_nodes)) {
@@ -1469,8 +1434,6 @@ static int prte_ras_slurm_shrink_job_to_survivors(const char *slurm_jobid, char 
         err = PRTE_ERR_SLURM_SHRINK_FAILURE;
         goto cleanup;
     }
-
-    prte_ras_slurm_cleanup_resize_scripts(slurm_jobid);
 
 cleanup:
     if (NULL != err_msg && PRTE_ERR_SLURM_SHRINK_FAILURE != err) {
