@@ -728,7 +728,13 @@ slurm-shim audit                 # every wrapped command, in order
 slurm-shim nodefile              # lines and bytes of the last srun's node file
 slurm-shim set bad_json 1        # scontrol --json prints garbage, exits 0
 slurm-shim set scancel_fail 1    # scancel fails, verbosely
+slurm-shim set slow 5            # scontrol, scancel and salloc sleep 5 s first
 ```
+
+`slow` is what `elastic_slow_scheduler_group` uses to check that a job still
+runs while the HNP waits on a slow scheduler command, during an extend and
+during a partial and a full release, and that a release waits for Slurm
+before it answers.
 
 Three properties of it are deliberate:
 

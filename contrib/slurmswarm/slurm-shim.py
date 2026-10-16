@@ -56,11 +56,14 @@
 #   fat_nodes <n>  the real record, with its allocation array replicated to n
 #                  nodes.  The job stays one Slurm can act on; only the part
 #                  PRRTE streams grows
+#   slow <secs>    `scontrol`, `scancel` and `salloc` sleep that long before
+#                  running, as on a slow filesystem or a slow slurmctld
 
 import json
 import os
 import subprocess
 import sys
+import time
 
 STATE = os.environ.get("SLURM_SHIM_STATE", "/tmp/slurm-shim")
 WRAPPED = ("salloc", "scontrol", "scancel", "srun")
@@ -164,6 +167,9 @@ def main():
     if "srun" == name:
         record_nodefile(argv)
 
+    if name in ("scontrol", "scancel", "salloc"):
+        time.sleep(float(flag("slow") or 0))
+
     if "scontrol" == name and "--json" in argv and "1" == flag("bad_json"):
         # Exit 0 with unparsable output on purpose: a non-zero status would be
         # caught by the caller's status check and never reach the parser,
@@ -176,8 +182,8 @@ def main():
             or flag("fat_field") not in (None, "", "0")
             or flag("fat_nodes") not in (None, "", "0")):
         # Forks where the other faults exec, because the scheduler's own
-        # record has to come back here to be grown.  Safe for scontrol, which
-        # PRRTE reads through popen and does not track by pid.
+        # record has to come back here to be grown.  Safe for scontrol, whose
+        # shell PRRTE waits for rather than the command itself.
         real = real_command(name)
         if real is None:
             sys.stderr.write("slurm-shim: no real %s on PATH\n" % name)

@@ -1229,6 +1229,7 @@ test_elastic() {
     elastic_argv_group
     elastic_propagate_group
     elastic_fault_group
+    elastic_slow_scheduler_group
     elastic_oversize_group
     elastic_launch_arg_limit_group
 }
@@ -2284,6 +2285,116 @@ elastic_fault_group() {
         SA 'pgrep -x prte >/dev/null' && ok "HNP survived a scancel failure" \
                                       || bad "HNP died when scancel failed"
     fi
+    dvm_stop
+    DVM_SHIM=0
+    cleanup_cluster
+}
+
+# A slow scontrol or scancel must not stall the DVM.  The shim delays both,
+# and a job launched while the HNP waits on one has to run anyway.  Each case
+# waits for the shim to log the command before it launches, so the job runs
+# while the command does.
+elastic_slow_scheduler_group() {
+    local out ajid nodes t0
+
+    banner "ras/slurm: a slow scheduler does not stall the DVM"
+    cleanup_cluster
+    if ! ON 1 "test -x $SHIM_BIN/slurm-shim"; then
+        skp "the recording shim is not in the volume -- rerun ./build.sh"
+        return
+    fi
+    SHIM reset >/dev/null 2>&1
+    ALLOC new --tag dvm --nodes 2 --tasks-per-node 2 >/dev/null 2>&1
+    DVM_SHIM=1
+    if ! dvm_start --prtemca prte_elastic_mode 1; then
+        DVM_SHIM=0
+        bad "no DVM came up under the recording shim"
+        skp "the slow-scheduler cases need a DVM"
+        cleanup_cluster
+        return
+    fi
+
+    SHIM set slow 5 >/dev/null 2>&1
+    SA_BG /tmp/slow-extend.out 'timeout 120 elastic extend 2'
+    t0=$SECONDS
+    until SHIM audit 2>/dev/null | grep -q 'scontrol show job'; do
+        [ $((SECONDS - t0)) -ge 15 ] && break
+        sleep 0.2
+    done
+    SA 'timeout 3 prun -n 1 hostname' >/dev/null 2>&1 \
+        && ok "a job ran while the extend's scontrol was slow" \
+        || bad "the DVM stalled behind the extend's scontrol"
+    t0=$SECONDS
+    until SHIM audit 2>/dev/null | grep -q '^salloc'; do
+        [ $((SECONDS - t0)) -ge 15 ] && break
+        sleep 0.2
+    done
+    SA 'timeout 3 prun -n 1 hostname' >/dev/null 2>&1 \
+        && ok "a job ran while salloc was slow to name the job" \
+        || bad "the DVM stalled behind salloc"
+    t0=$SECONDS
+    until SA 'grep -q "PHASE 2.*PMIX_DVM_IS_READY" /tmp/slow-extend.out' >/dev/null 2>&1; do
+        [ $((SECONDS - t0)) -ge 90 ] && break
+        sleep 1
+    done
+    out=$(SA 'cat /tmp/slow-extend.out' 2>&1)
+    ajid=$(echo "$out" | sed -n 's/^>>> ALLOC_ID \([0-9][0-9]*\).*/\1/p' | head -1)
+    if [ -z "$ajid" ] || ! echo "$out" | grep -q "PHASE 2.*PMIX_DVM_IS_READY"; then
+        bad "the extend never completed under a slow scheduler: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+        skp "the slow-release case needs an allocation to shrink"
+    else
+        ok "the extend completed under a slow scheduler"
+        nodes=$(job_nodes "$ajid")
+        SHIM reset >/dev/null 2>&1
+        SHIM set slow 5 >/dev/null 2>&1
+        SA_BG /tmp/slow-shrink.out "timeout 120 elastic shrink ${nodes%%,*}"
+        t0=$SECONDS
+        until SHIM audit 2>/dev/null | grep -q "scontrol update job $ajid"; do
+            [ $((SECONDS - t0)) -ge 30 ] && break
+            sleep 0.2
+        done
+        SA 'timeout 3 prun -n 1 hostname' >/dev/null 2>&1 \
+            && ok "a job ran while the release's scontrol was slow" \
+            || bad "the DVM stalled behind the release's scontrol"
+        SA 'grep -q "PHASE 2.*PMIX_DVM_IS_READY" /tmp/slow-shrink.out' >/dev/null 2>&1 \
+            && bad "the release completed before SLURM had resized the job" \
+            || ok "the release waited for SLURM"
+        t0=$SECONDS
+        until SA 'grep -q "PHASE 2.*PMIX_DVM_IS_READY" /tmp/slow-shrink.out' >/dev/null 2>&1; do
+            [ $((SECONDS - t0)) -ge 30 ] && break
+            sleep 1
+        done
+        SA 'grep -q "PHASE 2.*PMIX_DVM_IS_READY" /tmp/slow-shrink.out' >/dev/null 2>&1 \
+            && ok "the release completed under a slow scheduler" \
+            || bad "the release never completed: $(SA 'tail -c 300 /tmp/slow-shrink.out' | tr '\n' ' ')"
+        [ "$(SQ "squeue -h -j $ajid -o '%D'" | tr -d ' \r')" = 1 ] \
+            && ok "SLURM resized job $ajid while the DVM kept running" \
+            || bad "job $ajid was not resized to one node"
+
+        SHIM reset >/dev/null 2>&1
+        SHIM set slow 5 >/dev/null 2>&1
+        SA_BG /tmp/slow-release.out "timeout 120 elastic release-id $ajid"
+        t0=$SECONDS
+        until SHIM audit 2>/dev/null | grep -q "^scancel $ajid"; do
+            [ $((SECONDS - t0)) -ge 30 ] && break
+            sleep 0.2
+        done
+        SA 'timeout 3 prun -n 1 hostname' >/dev/null 2>&1 \
+            && ok "a job ran while the release's scancel was slow" \
+            || bad "the DVM stalled behind the release's scancel"
+        SA 'grep -q "PHASE 2.*PMIX_DVM_IS_READY" /tmp/slow-release.out' >/dev/null 2>&1 \
+            && bad "the release answered before SLURM had cancelled the job" \
+            || ok "the release waited for scancel"
+        t0=$SECONDS
+        until SA 'grep -q "PHASE 2.*PMIX_DVM_IS_READY" /tmp/slow-release.out' >/dev/null 2>&1; do
+            [ $((SECONDS - t0)) -ge 30 ] && break
+            sleep 1
+        done
+        [ -z "$(SQ "squeue -h -j $ajid -o '%i'" | tr -d ' \r')" ] \
+            && ok "SLURM cancelled job $ajid" \
+            || bad "job $ajid survived its release"
+    fi
+    SHIM set slow 0 >/dev/null 2>&1
     dvm_stop
     DVM_SHIM=0
     cleanup_cluster
