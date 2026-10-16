@@ -24,7 +24,7 @@ Files:
 | `ras_slurm_modify_extend.c` | `PMIX_ALLOC_EXTEND`/`PMIX_ALLOC_NEW`: vet the request, build & launch a `salloc --no-shell` expander job, wait for it, trim its time limit, absorb new nodes. |
 | `ras_slurm_modify_release.c` | `PMIX_ALLOC_RELEASE`: `scontrol update job` to shrink; remove nodes by count. |
 | `ras_slurm_modify_cancel.c` | `PMIX_ALLOC_REQ_CANCEL`: track and cancel pending extend requests. |
-| `ras_slurm_modify_common.c` | Shared helpers: `kill_job`, control-char checks, command-output draining. |
+| `ras_slurm_modify_common.c` | Shared helpers: the command runner, `kill_job`, control-char checks, command-output draining. |
 | `ras_slurm_jansson.c` | JSON path: reads a record through a fixed window; knows nothing of its shape past `jobs[0]`. |
 | `ras_slurm_jansson_nodes.c` | Walks `job_resources.nodes.allocation` for `add_modified_resources`. |
 | `ras_slurm_jansson_fields.c` | Reads the top-level fields, the job state and the job's times. |
@@ -272,6 +272,26 @@ check, and **nothing polls a queued job**.
   Not from `cancel_pending_req` — the completion path calls that, and it would
   recurse.
 
+### Slurm commands never block the HNP
+
+`scontrol` and `scancel` can take seconds on a slow filesystem or a slow
+slurmctld, and the progress thread does nothing else while it waits. So every
+`scontrol` and `scancel` after startup goes through `prte_ras_slurm_run_cmd`
+(`ras_slurm_modify_common.c`): it forks `sh -c <cmd>` with stdout on a
+`tmpfile()`, reaps the child through
+`prte_wait_cb`, and calls back with the wait status and the file, rewound.
+The JSON window walker reads that file as it read the pipe.
+
+- **`cbdata` is a PMIx object**, retained until the callback returns, so a
+  request answered meanwhile (a cancel) cannot free it under the command.
+- **From finalize on, commands run inline.** `prte_ras_slurm_run_cmd_finalize`
+  runs first in `finalize`: it waits for what is in flight without calling
+  back, since a `scancel` in flight is the only one its job gets, and every
+  later `run_cmd` waits for its child before returning. Nothing reaps a child
+  once the event base has stopped.
+- **`kill_job` reports a failed `scancel` itself.** `kill_job_then` also runs
+  a continuation once `scancel` exits, for a caller that must wait for it.
+
 ### Finalize cleans up in flight extends itself
 
 An incomplete extend owns a pending-request record, a wait tracker and a live
@@ -286,8 +306,8 @@ Four rules for that teardown:
 
 - **Do not answer the requester.** `pmix_server_finalize()` has already run,
   so the tracker holds the last reference to its request.
-- **Blocking is fine here, and only here.** `kill_job` uses `popen`; with the
-  loop stopped nothing can race `pclose`'s `waitpid`.
+- **Blocking is fine here, and only here.** The runner is inline by then; with
+  the loop stopped nothing can race its `waitpid`.
 - **Kill outright.** Nothing is left to ask for: the allocation is handled
   elsewhere — by the cancel half, or by the session drain — and a submission
   that failed was already signalled by `exec_salloc`. `salloc` does not

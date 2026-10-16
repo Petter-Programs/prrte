@@ -125,6 +125,8 @@ static int init(void)
 {
     int err = PRTE_SUCCESS;
 
+    prte_ras_slurm_run_cmd_init();
+
     prte_slurm_session_stack = PMIX_NEW(pmix_list_t);
 
     if(NULL == prte_slurm_session_stack) {
@@ -151,6 +153,7 @@ static int init(void)
 cleanup:
 
     if (PRTE_SUCCESS != err) {
+        prte_ras_slurm_run_cmd_finalize();
         prte_ras_slurm_modify_release_finalize();
         prte_ras_slurm_modify_cancel_finalize();
         prte_ras_slurm_modify_extend_finalize();
@@ -346,8 +349,10 @@ static pmix_status_t modify(prte_pmix_server_req_t *req)
 
 static int prte_ras_slurm_finalize(void)
 {
-    /* Cancel first: scancel is what gives the resources back, and killing a
-     * salloc child is not */
+    /* Commands still in flight first, so the scancels below run inline. Then
+     * cancel: scancel is what gives the resources back, and killing a salloc
+     * child is not */
+    prte_ras_slurm_run_cmd_finalize();
     prte_ras_slurm_modify_cancel_finalize();
     prte_ras_slurm_modify_extend_finalize();
     prte_ras_slurm_modify_release_finalize();

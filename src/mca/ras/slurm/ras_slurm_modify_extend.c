@@ -89,10 +89,6 @@ typedef struct {
     int tracker_index;
 } prte_slurm_salloc_child_t;
 
-/* Bound on how long finalize waits for a killed salloc to become reapable */
-#define PRTE_SLURM_REAP_WAIT_USEC 1000000    /* 1 sec */
-#define PRTE_SLURM_REAP_POLL_USEC 10000      /* 10 ms */
-
 /* Extends still in flight, for finalize to clean up */
 static pmix_list_t prte_slurm_salloc_children;
 static pmix_pointer_array_t prte_slurm_wait_trackers;
@@ -593,22 +589,7 @@ int prte_ras_slurm_modify_extend_finalize(void)
 
         /* Reap it. PID 1 is not always something that reaps, and an orphan
          * nobody waits on is a zombie for the life of the machine. */
-        for (uint64_t waited = 0; PRTE_SLURM_REAP_WAIT_USEC > waited;
-             waited += PRTE_SLURM_REAP_POLL_USEC) {
-            struct timespec tp = {0, PRTE_SLURM_REAP_POLL_USEC * 1000};
-            pid_t reaped = waitpid(child->pid, NULL, WNOHANG);
-
-            if (0 > reaped && EINTR == errno) {
-                continue;
-            }
-
-            /* Reaped, or never ours to wait for */
-            if (0 != reaped) {
-                break;
-            }
-
-            nanosleep(&tp, NULL);
-        }
+        prte_ras_slurm_reap(child->pid);
 
         /* This child's prte_wait_tracker_t is left holding a dangling cbdata,
          * which is what salloc_wait_cb's finalized check is for. */
@@ -1356,7 +1337,7 @@ static int prte_ras_slurm_launch_expander_job(pmix_hash_table_t *fields)
 
     if(PRTE_SUCCESS != err && job_id[0] != '\0') {
         /* Prevent hanging resources if failed */
-        prte_ras_slurm_kill_job(job_id, NULL, 0);
+        prte_ras_slurm_kill_job(job_id);
     }
 
     if(NULL != job_id_dyn) {
@@ -2284,7 +2265,7 @@ int prte_ras_slurm_serve_extend_req(prte_pmix_server_req_t *req)
     err = prte_ras_slurm_add_pending_req(request_id, job_id);
 
     if(PRTE_SUCCESS != err) {
-        prte_ras_slurm_kill_job(job_id, NULL, 0);
+        prte_ras_slurm_kill_job(job_id);
         goto cleanup;
     }
 

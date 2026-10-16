@@ -226,7 +226,7 @@ static void prte_ras_slurm_cancel_req_at(int idx)
         return;
     }
 
-    prte_ras_slurm_kill_job(pending_req->slurm_job_id, NULL, 0);
+    prte_ras_slurm_kill_job(pending_req->slurm_job_id);
 
     prte_ras_slurm_pending_req_free(pending_req);
     pmix_pointer_array_set_item(&pending_reqs, idx, NULL);

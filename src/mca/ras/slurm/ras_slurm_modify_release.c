@@ -475,8 +475,6 @@ static int prte_ras_slurm_complete_release_request(prte_pmix_server_req_t *req)
 void prte_ras_slurm_drain_session_stack(void)
 {
     prte_session_stack_item_t *item, *next;
-    char err_msg[PRTE_SLURM_ERR_STR_MAX_LEN + 1] = {0};
-    int err;
 
     PMIX_LIST_FOREACH_SAFE(item, next, prte_slurm_session_stack, prte_session_stack_item_t) {
         if (NULL == item->session || NULL == item->session->alloc_refid) {
@@ -484,14 +482,7 @@ void prte_ras_slurm_drain_session_stack(void)
         }
 
         if (prte_ras_slurm_session_is_dynamic(item->session)) {
-            err = prte_ras_slurm_kill_job(item->session->alloc_refid, err_msg,
-                                          sizeof(err_msg));
-            if (PRTE_ERR_SLURM_CANCEL_FAILURE == err) {
-                pmix_output(0, "ras:slurm:drain_session_stack: failed to kill job %s: %s.",
-                            item->session->alloc_refid, err_msg);
-            } else if (PRTE_SUCCESS != err) {
-                PRTE_ERROR_LOG(err);
-            }
+            prte_ras_slurm_kill_job(item->session->alloc_refid);
         }
 
         pmix_list_remove_item(prte_slurm_session_stack, &item->super);
@@ -559,13 +550,7 @@ int prte_ras_slurm_shrink_complete(prte_shrink_campaign_t *campaign)
 
             /* Killing the Slurm job is deliberately the final operation: a
              * resulting daemon departure cannot race with session teardown. */
-            err = prte_ras_slurm_kill_job(job_id, err_msg, sizeof(err_msg));
-            if (PRTE_ERR_SLURM_CANCEL_FAILURE == err) {
-                pmix_output(0, "ras:slurm:shrink_complete: failed to kill job %s: %s.",
-                            job_id, err_msg);
-            } else if (PRTE_SUCCESS != err) {
-                PRTE_ERROR_LOG(err);
-            }
+            prte_ras_slurm_kill_job(job_id);
             free(job_id);
         } else if (PRTE_RAS_SLURM_RELEASE_PARTIAL_JOB == action->action) {
             int old_count = session_item->nodes_in_session;

@@ -88,7 +88,16 @@ int prte_ras_slurm_shrink_complete(prte_shrink_campaign_t *campaign);
 void prte_ras_slurm_drain_session_stack(void);
 
 /* Common modify extend/release features */
-int prte_ras_slurm_kill_job(const char *slurm_jobid, char *err_msg, size_t err_msg_size);
+typedef void (*prte_ras_slurm_cmd_cbfunc_t)(int status, FILE *out, void *cbdata);
+void prte_ras_slurm_run_cmd_init(void);
+void prte_ras_slurm_run_cmd_finalize(void);
+int prte_ras_slurm_run_cmd(const char *cmdline, prte_ras_slurm_cmd_cbfunc_t cbfunc,
+                           pmix_object_t *cbdata);
+void prte_ras_slurm_reap(pid_t pid);
+typedef void (*prte_ras_slurm_kill_cbfunc_t)(pmix_object_t *cbdata);
+int prte_ras_slurm_kill_job(const char *slurm_jobid);
+int prte_ras_slurm_kill_job_then(const char *slurm_jobid, prte_ras_slurm_kill_cbfunc_t cbfunc,
+                                 pmix_object_t *cbdata);
 int prte_ras_slurm_token_has_control_chars(const char *s, size_t len, bool *has_control_chars);
 int prte_ras_slurm_drain_cmd_output(FILE *fp, char *output, size_t output_size);
 

@@ -13,9 +13,91 @@
 #include "constants.h"
 #include "types.h"
 
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "src/runtime/prte_globals.h"
+#include "src/runtime/prte_wait.h"
+
 #include "ras_slurm.h"
 #include "src/mca/common/slurm/common_slurm.h"
 #include "src/mca/ras/base/base.h"
+
+/* The wait status reported for a command whose child could not be waited
+ * for: an exit of 127, as a shell reports a command it could not run */
+#define PRTE_SLURM_CMD_LOST_STATUS (127 << 8)
+
+/* Bound on how long finalize waits for a killed child to become reapable */
+#define PRTE_SLURM_REAP_WAIT_USEC 1000000    /* 1 sec */
+#define PRTE_SLURM_REAP_POLL_USEC 10000      /* 10 ms */
+
+/* A Slurm command in flight */
+typedef struct {
+    pmix_list_item_t super;
+    pid_t pid;
+    FILE *out;
+    prte_ras_slurm_cmd_cbfunc_t cbfunc;
+    pmix_object_t *cbdata;
+} prte_ras_slurm_cmd_t;
+
+static void cmd_con(prte_ras_slurm_cmd_t *p)
+{
+    p->pid = -1;
+    p->out = NULL;
+    p->cbfunc = NULL;
+    p->cbdata = NULL;
+}
+
+static void cmd_des(prte_ras_slurm_cmd_t *p)
+{
+    if (NULL != p->out) {
+        fclose(p->out);
+    }
+
+    if (NULL != p->cbdata) {
+        PMIX_RELEASE(p->cbdata);
+    }
+}
+
+PMIX_CLASS_INSTANCE(prte_ras_slurm_cmd_t, pmix_list_item_t, cmd_con, cmd_des);
+
+/* The job a kill_job callback reports on, and what to run after */
+typedef struct {
+    pmix_object_t super;
+    char *job_id;
+    prte_ras_slurm_kill_cbfunc_t cbfunc;
+    pmix_object_t *cbdata;
+} prte_ras_slurm_kill_t;
+
+static void kill_con(prte_ras_slurm_kill_t *p)
+{
+    p->job_id = NULL;
+    p->cbfunc = NULL;
+    p->cbdata = NULL;
+}
+
+static void kill_des(prte_ras_slurm_kill_t *p)
+{
+    free(p->job_id);
+
+    if (NULL != p->cbdata) {
+        PMIX_RELEASE(p->cbdata);
+    }
+}
+
+PMIX_CLASS_INSTANCE(prte_ras_slurm_kill_t, pmix_object_t, kill_con, kill_des);
+
+static pmix_list_t prte_ras_slurm_cmds = PMIX_LIST_STATIC_INIT(prte_ras_slurm_cmds);
+/* Set once finalize has begun: nothing reaps a child after that */
+static bool cmds_inline = false;
 
 /**
  * @brief Can we serve an elastic allocation request?
@@ -95,33 +177,246 @@ bool prte_ras_slurm_have_extensions(bool quiet)
 #endif
 }
 
-/*
- * Cancel a Slurm job using scancel.
- *
- * If scancel returns an error, the stderr/stdout output is copied
- * into err_msg (truncated to buffer size). On success, err_msg is cleared.
- *
- * @param[in]  slurm_jobid   Null-terminated Slurm job ID string to cancel.
- * @param[out] err_msg       Buffer for error message, or NULL.
- * @param[in]  err_msg_size  Size of err_msg buffer, if applicable
- */
-int prte_ras_slurm_kill_job(const char *slurm_jobid, char *err_msg, size_t err_msg_size) {
+void prte_ras_slurm_run_cmd_init(void)
+{
+    PMIX_CONSTRUCT(&prte_ras_slurm_cmds, pmix_list_t);
+    cmds_inline = false;
+}
 
-    if(NULL == slurm_jobid) {
+void prte_ras_slurm_reap(pid_t pid)
+{
+    for (uint64_t waited = 0; PRTE_SLURM_REAP_WAIT_USEC > waited;
+         waited += PRTE_SLURM_REAP_POLL_USEC) {
+        struct timespec tp = {0, PRTE_SLURM_REAP_POLL_USEC * 1000};
+        pid_t reaped = waitpid(pid, NULL, WNOHANG);
+
+        if (0 > reaped && EINTR == errno) {
+            continue;
+        }
+
+        /* Reaped, or never ours to wait for */
+        if (0 != reaped) {
+            break;
+        }
+
+        nanosleep(&tp, NULL);
+    }
+}
+
+/* Wait for a child the event loop will not reap */
+static int cmd_wait_inline(pid_t pid)
+{
+    int status;
+
+    while (0 > waitpid(pid, &status, 0)) {
+        if (EINTR != errno) {
+            return PRTE_SLURM_CMD_LOST_STATUS;
+        }
+    }
+
+    return status;
+}
+
+void prte_ras_slurm_run_cmd_finalize(void)
+{
+    prte_ras_slurm_cmd_t *cmd;
+
+    cmds_inline = true;
+
+    /* Waited for, not killed: a scancel in flight is the only one its job
+     * gets. Nobody is called back: the requests behind these are dropped by
+     * their own finalize, after pmix_server_finalize() has run */
+    while (NULL != (cmd = (prte_ras_slurm_cmd_t *)
+                              pmix_list_remove_first(&prte_ras_slurm_cmds))) {
+        cmd_wait_inline(cmd->pid);
+        /* Its prte_wait_tracker_t is left holding a dangling cbdata, which is
+         * what cmd_wait_cb's check is for */
+        PMIX_RELEASE(cmd);
+    }
+}
+
+static void cmd_complete(prte_ras_slurm_cmd_t *cmd, int status)
+{
+    rewind(cmd->out);
+    cmd->cbfunc(status, cmd->out, cmd->cbdata);
+    PMIX_RELEASE(cmd);
+}
+
+/*
+ * Reap a command's child, and hand its output to the caller.
+ *
+ * @param[in] cbdata The prte_wait_tracker_t, NOT the data handed to
+ *                   prte_wait_cb - that is at its cbdata member.
+ */
+static void cmd_wait_cb(int fd, short args, void *cbdata)
+{
+    prte_wait_tracker_t *t2 = (prte_wait_tracker_t *) cbdata;
+    prte_ras_slurm_cmd_t *cmd = (prte_ras_slurm_cmd_t *) t2->cbdata;
+    int status = t2->child->exit_code;
+    PRTE_HIDE_UNUSED_PARAMS(fd, args);
+
+    /* The tracker owns the dummy proc; nothing owns cbdata but us */
+    PMIX_RELEASE(t2);
+
+    /* Past finalize, cmd has already been killed, reaped and freed */
+    if (cmds_inline) {
+        return;
+    }
+
+    pmix_list_remove_item(&prte_ras_slurm_cmds, &cmd->super);
+    cmd_complete(cmd, status);
+}
+
+/*
+ * Run a shell command with its stdout in an unlinked temporary file, and call
+ * cbfunc with its raw wait status and that file, rewound, when it exits. The file is closed when cbfunc returns. cbdata, which may be
+ * NULL, is retained until then.
+ *
+ * Once finalize has begun nothing reaps the child, so the command then runs
+ * to completion before this returns.
+ *
+ * Returns an error, and does not call cbfunc, when the command cannot be
+ * started.
+ */
+int prte_ras_slurm_run_cmd(const char *cmdline, prte_ras_slurm_cmd_cbfunc_t cbfunc,
+                           pmix_object_t *cbdata)
+{
+    prte_ras_slurm_cmd_t *cmd = NULL;
+    prte_proc_t *dummy = NULL;
+    int err = PRTE_SUCCESS;
+    pid_t pid;
+
+    if (NULL == cmdline || NULL == cbfunc) {
         PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
         return PRTE_ERR_BAD_PARAM;
     }
 
-    if(NULL != err_msg) {
-        err_msg[0] = '\0';
+    PMIX_OUTPUT_VERBOSE((10, prte_ras_base_framework.framework_output,
+                         "%s ras:slurm:run_cmd: %s",
+                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), cmdline));
+
+    cmd = PMIX_NEW(prte_ras_slurm_cmd_t);
+    dummy = PMIX_NEW(prte_proc_t);
+
+    if (NULL == cmd || NULL == dummy) {
+        err = PRTE_ERR_OUT_OF_RESOURCE;
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
     }
 
-    int err = PRTE_SUCCESS;
+    /* Not the session directory: finalize runs commands after it is gone */
+    cmd->out = tmpfile();
+    if (NULL == cmd->out) {
+        pmix_output(0, "ras:slurm:run_cmd: cannot create a temporary file: %s", strerror(errno));
+        err = PRTE_ERR_FILE_OPEN_FAILURE;
+        goto cleanup;
+    }
+
+    /* Only this command's child may hold it; dup2 clears the flag on its
+     * stdout */
+    fcntl(fileno(cmd->out), F_SETFD, FD_CLOEXEC);
+
+    pid = fork();
+
+    if (0 > pid) {
+        pmix_output(0, "ras:slurm:run_cmd: fork failed: %s", strerror(errno));
+        err = PRTE_ERR_SYS_LIMITS_CHILDREN;
+        goto cleanup;
+    }
+
+    if (0 == pid) {
+        int devnull = open("/dev/null", O_RDONLY);
+
+        if (0 <= devnull) {
+            dup2(devnull, STDIN_FILENO);
+        }
+
+        if (0 > dup2(fileno(cmd->out), STDOUT_FILENO)) {
+            _exit(127);
+        }
+
+        execl("/bin/sh", "sh", "-c", cmdline, (char *) NULL);
+        _exit(127);
+    }
+
+    cmd->pid = pid;
+    cmd->cbfunc = cbfunc;
+    if (NULL != cbdata) {
+        PMIX_RETAIN(cbdata);
+        cmd->cbdata = cbdata;
+    }
+
+    if (cmds_inline) {
+        cmd_complete(cmd, cmd_wait_inline(pid));
+        cmd = NULL;
+        goto cleanup;
+    }
+
+    pmix_list_append(&prte_ras_slurm_cmds, &cmd->super);
+
+    dummy->pid = pid;
+    /* be sure to mark it as alive so we don't instantly fire */
+    PRTE_FLAG_SET(dummy, PRTE_PROC_FLAG_ALIVE);
+    prte_wait_cb(dummy, cmd_wait_cb, cmd);
+    /* The list owns cmd from here */
+    cmd = NULL;
+
+cleanup:
+    if (NULL != cmd) {
+        PMIX_RELEASE(cmd);
+    }
+
+    /* prte_wait_cb retains it */
+    if (NULL != dummy) {
+        PMIX_RELEASE(dummy);
+    }
+
+    return err;
+}
+
+static void kill_job_cb(int status, FILE *out, void *cbdata)
+{
+    prte_ras_slurm_kill_t *kill_data = (prte_ras_slurm_kill_t *) cbdata;
+    char err_msg[PRTE_SLURM_ERR_STR_MAX_LEN + 1];
+
+    if (!WIFEXITED(status) || 0 != WEXITSTATUS(status)) {
+        if (PRTE_SUCCESS != prte_ras_slurm_drain_cmd_output(out, err_msg, sizeof(err_msg))) {
+            err_msg[0] = '\0';
+        }
+
+        pmix_output(0, "ras:slurm:kill_job: failed to kill job %s: %s.",
+                    kill_data->job_id, err_msg);
+    }
+
+    if (NULL != kill_data->cbfunc) {
+        kill_data->cbfunc(kill_data->cbdata);
+    }
+}
+
+/*
+ * Cancel a Slurm job using scancel. A failure is reported once scancel exits,
+ * and cbfunc, when given, is called after that with cbdata, which is retained
+ * until then. Neither happens when an error is returned.
+ *
+ * @param[in]  slurm_jobid   Null-terminated Slurm job ID string to cancel.
+ */
+int prte_ras_slurm_kill_job_then(const char *slurm_jobid, prte_ras_slurm_kill_cbfunc_t cbfunc,
+                                 pmix_object_t *cbdata)
+{
+    static const char *cmd_format = "scancel %s 2>&1";
+    prte_ras_slurm_kill_t *kill_data;
+    char *cmd = NULL;
+    int err;
+
+    if (NULL == slurm_jobid) {
+        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
+        return PRTE_ERR_BAD_PARAM;
+    }
 
     /* Make sure the job ID given is something reasonable */
     err = prte_ras_slurm_validate_jobid(slurm_jobid);
 
-    if(PRTE_SUCCESS != err) {
+    if (PRTE_SUCCESS != err) {
         PRTE_ERROR_LOG(err);
         return err;
     }
@@ -130,62 +425,37 @@ int prte_ras_slurm_kill_job(const char *slurm_jobid, char *err_msg, size_t err_m
                         "%s ras:slurm:kill_job: killing job %s",
                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), slurm_jobid));
 
-    static const char *cmd_format = "scancel %s 2>&1";
+    kill_data = PMIX_NEW(prte_ras_slurm_kill_t);
 
-    char *cmd = NULL;
-
-    FILE *fp = NULL;
-
-    if(0 > asprintf(&cmd, cmd_format, slurm_jobid)) {
+    if (NULL == kill_data || NULL == (kill_data->job_id = strdup(slurm_jobid)) ||
+        0 > asprintf(&cmd, cmd_format, slurm_jobid)) {
         cmd = NULL;
         err = PRTE_ERR_OUT_OF_RESOURCE;
         PRTE_ERROR_LOG(err);
         goto cleanup;
     }
 
-    fp = popen(cmd, "r");
-
-    if(NULL == fp) {
-        err = PRTE_ERR_FILE_OPEN_FAILURE;
-        PRTE_ERROR_LOG(err);
-        goto cleanup;
+    kill_data->cbfunc = cbfunc;
+    if (NULL != cbdata) {
+        PMIX_RETAIN(cbdata);
+        kill_data->cbdata = cbdata;
     }
 
-    err = prte_ras_slurm_drain_cmd_output(fp, err_msg, err_msg_size);
+    err = prte_ras_slurm_run_cmd(cmd, kill_job_cb, &kill_data->super);
 
-    if (PRTE_SUCCESS != err) {
-        PRTE_ERROR_LOG(err);
-        goto cleanup;
-    }
-
-    int status = pclose(fp);
-    fp = NULL;
-
-    if (-1 == status) {
-        pmix_output(0, "ras:slurm:kill_job: pclose failed: %s.", strerror(errno));
-        err = PRTE_ERR_IN_ERRNO;
-        PRTE_ERROR_LOG(err);
-        goto cleanup;
-    }
-
-    if (!WIFEXITED(status) || 0 != WEXITSTATUS(status)) {
-        err = PRTE_ERR_SLURM_CANCEL_FAILURE;
-        goto cleanup;
-    }
-
-    cleanup:
-
-    if(NULL != err_msg && PRTE_ERR_SLURM_CANCEL_FAILURE != err) {
-        err_msg[0] = '\0';
-    }
-
-    if(NULL != fp) {
-        pclose(fp);
+cleanup:
+    if (NULL != kill_data) {
+        PMIX_RELEASE(kill_data);
     }
 
     free(cmd);
 
     return err;
+}
+
+int prte_ras_slurm_kill_job(const char *slurm_jobid)
+{
+    return prte_ras_slurm_kill_job_then(slurm_jobid, NULL, NULL);
 }
 
 /*
@@ -217,10 +487,10 @@ int prte_ras_slurm_token_has_control_chars(const char *s, size_t len, bool *has_
 /**
  * @brief Drain command output and optionally capture it.
  *
- * Consumes all data from a popen() stream. When provided, output is
- * populated with command output, potentially truncated to fit the buffer.
+ * Consumes all data from a command's output stream. When provided, output
+ * is populated with command output, potentially truncated to fit the buffer.
  *
- * @param[in] fp Stream returned by popen().
+ * @param[in] fp Command output stream.
  * @param[out] output Optional output buffer.
  * @param[in] output_size Size of output buffer.
  */
