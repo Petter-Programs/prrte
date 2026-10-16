@@ -68,6 +68,8 @@ typedef struct {
     char *job_id;
     /* request_id names this extend's pending-request record */
     bool pending_added;
+    /* The salloc that submits the expander, once forked */
+    pid_t salloc_pid;
     int err;
     uint64_t retry_delay_usec;
     int attempts;
@@ -85,14 +87,21 @@ typedef struct {
 
 /* Everything the reap callback needs, plus the index of the extend this child
  * belongs to. An index and not a reference, because either object can outlive
- * the other: a stale index reads back NULL, and the job ID catches a slot the
+ * the other: a stale index reads back NULL, and the pid catches a slot the
  * array has since reused. */
 typedef struct {
     pmix_list_item_t super;
+    prte_event_t ev;
     pid_t pid;
     int outfd;
     char *job_id;
     int tracker_index;
+    /* The job-ID scan: the line so far, whether ev is armed, and whether the
+     * scan has reached its answer */
+    char line[PRTE_SLURM_ALLOC_LINE_MAX + 1];
+    size_t n;
+    bool reading;
+    bool scanned;
 } prte_slurm_salloc_child_t;
 
 /* Extends still in flight, for finalize to clean up */
@@ -108,10 +117,13 @@ static void swt_des(prte_slurm_wait_tracker_t *p);
 static void ssc_con(prte_slurm_salloc_child_t *p);
 static void ssc_des(prte_slurm_salloc_child_t *p);
 static void salloc_wait_cb(int fd, short args, void *cbdata);
+static void prte_ras_slurm_salloc_scan_end(prte_slurm_salloc_child_t *child, const char *buf,
+                                           size_t len, bool alive);
 static int prte_ras_slurm_make_salloc_arg(pmix_hash_table_t *fields, const char *field_name, const char *field_format, bool obj_num, char ***argv);
 static int prte_ras_slurm_make_count_envar_arg(const char *envar, const char *field_format, char ***argv);
-static int prte_ras_slurm_exec_salloc(char * const *argv, char *job_id);
-static int prte_ras_slurm_launch_expander_job(pmix_hash_table_t *fields);
+static int prte_ras_slurm_exec_salloc(char * const *argv, prte_slurm_wait_tracker_t *trk);
+static int prte_ras_slurm_launch_expander_job(pmix_hash_table_t *fields,
+                                              prte_slurm_wait_tracker_t *trk);
 static int prte_ras_slurm_parse_propagate_extra(void);
 static int prte_ras_slurm_reject_node_duplicates(pmix_list_t *node_list);
 static int prte_ras_slurm_extract_reused_nodes(const char *slurm_jobid,
@@ -161,7 +173,6 @@ const char *const num_obj_subfields[NUM_OBJ_SUBFIELD_COUNT] = {
 const char *const record_job_data_fields[PRTE_JOB_DATA_COUNT] = {
     [PRTE_JOB_DATA_NODES]  = "prte:nodes",
     [PRTE_JOB_DATA_NODELIST] = "prte:nodelist",
-    [PRTE_JOB_DATA_JOB_ID] = "prte:job_id",
 };
 
 /* Number of fields to expect inside job record hash table */
@@ -237,6 +248,7 @@ static void swt_con(prte_slurm_wait_tracker_t *p)
     p->user_request_id_provided = false;
     p->job_id = NULL;
     p->pending_added = false;
+    p->salloc_pid = -1;
     p->err = PRTE_SUCCESS;
     p->retry_delay_usec = PRTE_SLURM_GRANT_RETRY_MIN_USEC;
     p->attempts = 0;
@@ -278,6 +290,10 @@ static void ssc_con(prte_slurm_salloc_child_t *p)
     p->outfd = -1;
     p->job_id = NULL;
     p->tracker_index = -1;
+    p->line[0] = '\0';
+    p->n = 0;
+    p->reading = false;
+    p->scanned = false;
 }
 
 /*
@@ -285,6 +301,10 @@ static void ssc_con(prte_slurm_salloc_child_t *p)
  */
 static void ssc_des(prte_slurm_salloc_child_t *p)
 {
+    if (p->reading) {
+        prte_event_del(&p->ev);
+    }
+
     if (0 <= p->outfd) {
         close(p->outfd);
     }
@@ -514,20 +534,21 @@ int prte_ras_slurm_modify_extend_init(void)
 }
 
 /*
- * Find the extend a finished salloc child belongs to, or NULL if it has none.
+ * Find the extend a salloc child belongs to, or NULL if it has none or it has
+ * been answered.
  */
 static prte_slurm_wait_tracker_t *prte_ras_slurm_tracker_for_child(const prte_slurm_salloc_child_t *child)
 {
     prte_slurm_wait_tracker_t *trk;
 
-    if (0 > child->tracker_index || NULL == child->job_id) {
+    if (0 > child->tracker_index) {
         return NULL;
     }
 
     trk = (prte_slurm_wait_tracker_t *)
               pmix_pointer_array_get_item(&prte_slurm_wait_trackers, child->tracker_index);
 
-    if (NULL == trk || NULL == trk->job_id || 0 != strcmp(trk->job_id, child->job_id)) {
+    if (NULL == trk || trk->salloc_pid != child->pid) {
         return NULL;
     }
 
@@ -536,23 +557,6 @@ static prte_slurm_wait_tracker_t *prte_ras_slurm_tracker_for_child(const prte_sl
     }
 
     return trk;
-}
-
-/*
- * Point the salloc child that created a job at the extend waiting on it. Not
- * done in exec_salloc: the tracker needs the job ID that call goes to get.
- */
-static void prte_ras_slurm_link_child_to_tracker(const char *job_id, int tracker_index)
-{
-    prte_slurm_salloc_child_t *child;
-
-    PMIX_LIST_FOREACH(child, &prte_slurm_salloc_children, prte_slurm_salloc_child_t)
-    {
-        if (NULL != child->job_id && 0 == strcmp(child->job_id, job_id)) {
-            child->tracker_index = tracker_index;
-            return;
-        }
-    }
 }
 
 /*
@@ -597,7 +601,7 @@ int prte_ras_slurm_modify_extend_finalize(void)
         /* No SIGTERM first: nothing is left to ask for. Its allocation is
          * somebody else's to give back - the cancel half, or the session
          * drain - and a submission that failed was already signalled by
-         * exec_salloc. salloc does not reliably act on one anyway. */
+         * the job-ID scan. salloc does not reliably act on one anyway. */
         kill(child->pid, SIGKILL);
 
         /* Reap it. PID 1 is not always something that reaps, and an orphan
@@ -777,6 +781,12 @@ static void salloc_wait_cb(int fd, short args, void *cbdata)
     }
 
     tail[n] = '\0';
+
+    /* salloc may name the job and exit before the read event runs */
+    if (!child->scanned) {
+        prte_ras_slurm_salloc_scan_end(child, tail, n, false);
+    }
+
     close(child->outfd);
     child->outfd = -1;
 
@@ -810,7 +820,7 @@ static void salloc_wait_cb(int fd, short args, void *cbdata)
     PMIX_RELEASE(t2);
 
     /* No tracker: the extend was already answered, or never got one */
-    if (NULL != trk) {
+    if (NULL != trk && NULL != trk->job_id) {
         slurm_grant_check_cb(-1, 0, trk);
     }
 }
@@ -856,41 +866,218 @@ static bool prte_ras_slurm_line_job_id(const char *line, char *job_id)
 }
 
 /*
- * Run salloc and capture the Slurm job ID it announces.
+ * Carry on with an extend whose salloc has named the job it submitted: record
+ * it for cancellation, and wait for salloc to exit.
+ */
+static void prte_ras_slurm_salloc_named(prte_slurm_salloc_child_t *child, const char *job_id)
+{
+    prte_slurm_wait_tracker_t *trk = prte_ras_slurm_tracker_for_child(child);
+    int err;
+
+    /* Purely so the reap can name the job it belonged to */
+    child->job_id = strdup(job_id);
+
+    /* Answered meanwhile, by a cancel: nobody wants the job */
+    if (NULL == trk) {
+        prte_ras_slurm_kill_job(job_id);
+        return;
+    }
+
+    PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
+                         "%s ras:slurm:launch_expander_job: got job ID %s",
+                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), job_id));
+
+    if (NULL == trk->request_id && NULL == (trk->request_id = strdup(job_id))) {
+        err = PRTE_ERR_OUT_OF_RESOURCE;
+        PRTE_ERROR_LOG(err);
+        goto fail;
+    }
+
+    err = prte_ras_slurm_add_pending_req(trk->request_id, job_id);
+
+    if (PRTE_SUCCESS != err) {
+        goto fail;
+    }
+
+    trk->pending_added = true;
+
+    /* From here the completion's cancel_pending_req gives the job back */
+    trk->job_id = strdup(job_id);
+
+    if (NULL == trk->job_id) {
+        err = PRTE_ERR_OUT_OF_RESOURCE;
+        PRTE_ERROR_LOG(err);
+        goto fail;
+    }
+
+    /* Nothing is asked of Slurm here. salloc holds the handshake until the job
+     * leaves PENDING, so its exit is the notice that there is something to
+     * ask about. */
+    return;
+
+fail:
+    if (!trk->pending_added) {
+        prte_ras_slurm_kill_job(job_id);
+    }
+    trk->err = err;
+    prte_ras_slurm_extend_complete(trk, NULL);
+}
+
+/*
+ * Feed salloc output to the job-ID scan, a line at a time.
  *
- * Executes the command specified by argv in a child process and reads that
- * child's output until it names the job it created. salloc announces the job
- * as soon as the request reaches slurmctld, whether or not it can be satisfied
- * immediately: "salloc: Pending job allocation <id>" when the request queues,
- * "salloc: Granted job allocation <id>" when it does not.
+ * @return true once a line names the job, which job_id then holds.
+ */
+static bool prte_ras_slurm_salloc_scan(prte_slurm_salloc_child_t *child, const char *buf,
+                                       size_t len, char *job_id)
+{
+    for (size_t i = 0; i < len; i++) {
+        if ('\n' != buf[i]) {
+            /* Anything longer than this cannot be the line we want, so stop
+             * storing it rather than growing the buffer */
+            if (PRTE_SLURM_ALLOC_LINE_MAX > child->n) {
+                child->line[child->n++] = buf[i];
+            }
+            continue;
+        }
+
+        child->line[child->n] = '\0';
+        child->n = 0;
+
+        if (prte_ras_slurm_line_job_id(child->line, job_id)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/*
+ * Settle the job-ID scan with the last of salloc's output: carry on with the
+ * extend if it named the job, fail it otherwise.
+ *
+ * @param[in] alive Whether salloc may still be running.
+ */
+static void prte_ras_slurm_salloc_scan_end(prte_slurm_salloc_child_t *child, const char *buf,
+                                           size_t len, bool alive)
+{
+    char job_id[PRTE_SLURM_JOB_ID_MAX_LEN + 1];
+    prte_slurm_wait_tracker_t *trk;
+    bool named;
+
+    if (child->reading) {
+        prte_event_del(&child->ev);
+        child->reading = false;
+    }
+    child->scanned = true;
+
+    named = prte_ras_slurm_salloc_scan(child, buf, len, job_id);
+
+    /* A final line without a newline - which is what a failure diagnostic
+     * can arrive as - still counts */
+    if (!named) {
+        child->line[child->n] = '\0';
+        child->n = 0;
+        named = prte_ras_slurm_line_job_id(child->line, job_id);
+    }
+
+    if (named) {
+        prte_ras_slurm_salloc_named(child, job_id);
+        return;
+    }
+
+    PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
+                         "%s ras:slurm:exec_salloc: salloc named no job before it stopped talking",
+                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
+
+    /* A child that named no job may still be about to create one, and only it
+     * can revoke a pending allocation, so ask it to. Its reap still runs and
+     * still gives the pipe back. */
+    if (alive) {
+        kill(child->pid, SIGTERM);
+    }
+
+    trk = prte_ras_slurm_tracker_for_child(child);
+    if (NULL != trk) {
+        trk->err = PRTE_ERR_SLURM_SUBMIT_FAILURE;
+        PRTE_ERROR_LOG(trk->err);
+        prte_ras_slurm_extend_complete(trk, NULL);
+    }
+}
+
+/*
+ * Read what salloc says until it names the job. Runs whenever its pipe is
+ * readable, so a slow slurmctld does not hold up the event loop.
+ */
+static void salloc_output_cb(int fd, short args, void *cbdata)
+{
+    prte_slurm_salloc_child_t *child = (prte_slurm_salloc_child_t *) cbdata;
+    char job_id[PRTE_SLURM_JOB_ID_MAX_LEN + 1];
+    char buf[PRTE_SLURM_ALLOC_LINE_MAX];
+    PRTE_HIDE_UNUSED_PARAMS(fd, args);
+
+    while (true) {
+        ssize_t r = read(child->outfd, buf, sizeof(buf));
+
+        if (0 > r && EINTR == errno) {
+            continue;
+        }
+
+        if (0 > r && (EAGAIN == errno || EWOULDBLOCK == errno)) {
+            return;
+        }
+
+        if (0 > r) {
+            PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
+                                 "%s ras:slurm:exec_salloc: pipe read failed: %s",
+                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), strerror(errno)));
+            r = 0;
+        }
+
+        /* salloc is done talking */
+        if (0 == r) {
+            prte_ras_slurm_salloc_scan_end(child, NULL, 0, true);
+            return;
+        }
+
+        if (prte_ras_slurm_salloc_scan(child, buf, (size_t) r, job_id)) {
+            /* Nothing reads the pipe from here until the reap, which is only
+             * safe because salloc's remaining output is a few hundred bytes */
+            prte_event_del(&child->ev);
+            child->reading = false;
+            child->scanned = true;
+            prte_ras_slurm_salloc_named(child, job_id);
+            return;
+        }
+    }
+}
+
+/*
+ * Run salloc for an extend, and hand its output to the job-ID scan.
+ *
+ * salloc announces the job as soon as the request reaches slurmctld, whether
+ * or not it can be satisfied immediately: "salloc: Pending job allocation
+ * <id>" when the request queues, "salloc: Granted job allocation <id>" when it
+ * does not. salloc_output_cb reads that as it arrives, so the extend carries
+ * on from prte_ras_slurm_salloc_named, or fails, without this call waiting.
  *
  * The child is NOT waited on here. Under "--no-shell" salloc is the process
  * holding the handshake with Slurm, and it does not exit until the allocation
  * is granted; killing it while the job is pending revokes the allocation. So
  * it is left running and handed to the SIGCHLD machinery, which reaps it
- * whenever it finishes (see salloc_wait_cb). The caller gets the job ID
- * immediately and can proceed to poll Slurm for the allocation.
+ * whenever it finishes (see salloc_wait_cb).
  *
  * @param[in] argv NULL-terminated argument vector for execvp().
- * @param[out] job_id Buffer of size PRTE_SLURM_JOB_ID_MAX_LEN+1 that receives
- *                    the null-terminated numeric job ID on success.
+ * @param[in] trk The extend the job is for.
  */
-static int prte_ras_slurm_exec_salloc(char * const *argv, char *job_id)
+static int prte_ras_slurm_exec_salloc(char * const *argv, prte_slurm_wait_tracker_t *trk)
 {
-    if(NULL == argv || NULL == argv[0] || NULL == job_id) {
+    if(NULL == argv || NULL == argv[0] || NULL == trk) {
         PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
         return PRTE_ERR_BAD_PARAM;
     }
 
     int err = PRTE_SUCCESS;
-
-    job_id[0] = '\0';
-
-    char line[PRTE_SLURM_ALLOC_LINE_MAX + 1];
-    size_t n = 0;
-
-    bool found = false;
-    bool child_adopted = false;
 
     pid_t pid;
 
@@ -992,7 +1179,8 @@ static int prte_ras_slurm_exec_salloc(char * const *argv, char *job_id)
     child->pid = pid;
     child->outfd = pipefd[0];
     pipefd[0] = -1;
-    child_adopted = true;
+    child->tracker_index = trk->tracker_index;
+    trk->salloc_pid = pid;
 
     /* The list owns our reference from here */
     pmix_list_append(&prte_slurm_salloc_children, &child->super);
@@ -1005,72 +1193,16 @@ static int prte_ras_slurm_exec_salloc(char * const *argv, char *job_id)
     PMIX_RELEASE(dummy);
     dummy = NULL;
 
-    /* Read salloc's output a line at a time until one names the job */
-    while (!found) {
-        char c;
-        ssize_t r = read(child->outfd, &c, 1);
-
-        /* Tolerate interruptions */
-        if (0 > r && EINTR == errno) {
-            continue;
-        }
-
-        if (0 > r) {
-            char *strerr = strerror(errno);
-            err = PRTE_ERR_PIPE_READ_FAILURE;
-            PRTE_ERROR_LOG(err);
-            PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
-            "%s ras:slurm:exec_salloc: pipe read failed: %s",
-            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), strerr));
-            break;
-        }
-
-        /* salloc is done talking. A final line without a newline - which is
-         * what a failure diagnostic can arrive as - still counts. */
-        if (0 == r) {
-            line[n] = '\0';
-            found = prte_ras_slurm_line_job_id(line, job_id);
-            break;
-        }
-
-        if ('\n' != c) {
-            /* Anything longer than this cannot be the line we want, so stop
-             * storing it rather than growing the buffer */
-            if (PRTE_SLURM_ALLOC_LINE_MAX > n) {
-                line[n++] = c;
-            }
-            continue;
-        }
-
-        line[n] = '\0';
-        n = 0;
-        found = prte_ras_slurm_line_job_id(line, job_id);
-    }
-
-    if (!found) {
-        if (PRTE_SUCCESS == err) {
-            PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
-            "%s ras:slurm:exec_salloc: salloc named no job before it stopped talking",
-            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
-            err = PRTE_ERR_SLURM_SUBMIT_FAILURE;
-            PRTE_ERROR_LOG(err);
-        }
-        goto cleanup;
-    }
-
-    /* Purely so the reap can name the job it belonged to */
-    child->job_id = strdup(job_id);
+    fcntl(child->outfd, F_SETFL, fcntl(child->outfd, F_GETFL) | O_NONBLOCK);
+    prte_event_set(prte_event_base, &child->ev, child->outfd, PRTE_EV_READ | PRTE_EV_PERSIST,
+                   salloc_output_cb, child);
+    prte_event_add(&child->ev, NULL);
+    child->reading = true;
+    child = NULL;
 
     cleanup:
 
-    /* A child that named no job may still be about to create one, and only it
-     * can revoke a pending allocation, so ask it to. Its reap still runs and
-     * still gives the pipe back. */
-    if(PRTE_SUCCESS != err && child_adopted) {
-        kill(child->pid, SIGTERM);
-    }
-
-    if(!child_adopted && NULL != child) {
+    if(NULL != child) {
         PMIX_RELEASE(child);
     }
 
@@ -1104,16 +1236,18 @@ static int prte_ras_slurm_exec_salloc(char * const *argv, char *job_id)
  * the one node that could never be handed back on its own. "--no-shell" runs
  * nothing at all, so no node anchors the job and any of them can go.
  *
- * On success, the resulting SLURM job ID is stored back into the hash table
- * under PRTE_JOB_DATA_JOB_ID.
+ * Returns once salloc is running; the job ID arrives later, through
+ * prte_ras_slurm_salloc_named.
  *
- * @param[in,out] fields
- *     Hash table containing job configuration inputs and receiving the
- *     resulting job ID on success.
+ * @param[in] fields
+ *     Hash table containing job configuration inputs.
+ * @param[in] trk
+ *     The extend the job is for.
  */
-static int prte_ras_slurm_launch_expander_job(pmix_hash_table_t *fields)
+static int prte_ras_slurm_launch_expander_job(pmix_hash_table_t *fields,
+                                              prte_slurm_wait_tracker_t *trk)
 {
-    if(NULL == fields) {
+    if(NULL == fields || NULL == trk) {
         PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
         return PRTE_ERR_BAD_PARAM;
     }
@@ -1124,9 +1258,6 @@ static int prte_ras_slurm_launch_expander_job(pmix_hash_table_t *fields)
     char **argv = NULL;
 
     bool have_gres = false;
-
-    char job_id[PRTE_SLURM_JOB_ID_MAX_LEN+1] = {0};
-    char *job_id_dyn = NULL;
 
     for (int i = 0; initial_args[i] != NULL; i++) {
         pmix_err = PMIx_Argv_append_nosize(&argv, initial_args[i]);
@@ -1316,46 +1447,9 @@ static int prte_ras_slurm_launch_expander_job(pmix_hash_table_t *fields)
         }
     }
 
-    err = prte_ras_slurm_exec_salloc(argv, job_id);
-
-    if(PRTE_SUCCESS != err) {
-        goto cleanup;
-    }
-
-    PMIX_OUTPUT_VERBOSE((10, prte_ras_base_framework.framework_output,
-                "%s ras:slurm:launch_expander_job: got job ID %s",
-                PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), job_id));
-
-    job_id_dyn = strdup(job_id);
-
-    if(NULL == job_id_dyn) {
-        err = PRTE_ERR_OUT_OF_RESOURCE;
-        PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
-        goto cleanup;
-    }
-
-    pmix_err = pmix_hash_table_set_value_ptr(fields, record_job_data_fields[PRTE_JOB_DATA_JOB_ID],
-                        strlen(record_job_data_fields[PRTE_JOB_DATA_JOB_ID]), (void*)job_id_dyn);
-
-    if(PMIX_SUCCESS != pmix_err) {
-        err = prte_pmix_convert_status(pmix_err);
-        PRTE_ERROR_LOG(err);
-        goto cleanup;
-    }
-
-    /* Now owned by the table */
-    job_id_dyn = NULL;
+    err = prte_ras_slurm_exec_salloc(argv, trk);
 
     cleanup:
-
-    if(PRTE_SUCCESS != err && job_id[0] != '\0') {
-        /* Prevent hanging resources if failed */
-        prte_ras_slurm_kill_job(job_id);
-    }
-
-    if(NULL != job_id_dyn) {
-        free(job_id_dyn);
-    }
 
     PMIx_Argv_free(argv);
 
@@ -2133,7 +2227,6 @@ static void prte_ras_slurm_extend_parent_cb(int status, FILE *out, void *cbdata)
     time_t parent_end = 0;
 
     char *nodes_string = NULL;
-    char *job_id = NULL;
 
     /* Answered by a cancel while scontrol ran */
     if (trk->completing) {
@@ -2222,51 +2315,12 @@ static void prte_ras_slurm_extend_parent_cb(int status, FILE *out, void *cbdata)
         }
     }
 
-    err = prte_ras_slurm_launch_expander_job(&slurm_jobfields);
+    err = prte_ras_slurm_launch_expander_job(&slurm_jobfields, trk);
 
     if(PRTE_SUCCESS != err) {
         pmix_output(0, "ras:slurm:modify: error launching Slurm job with new resources.");
         goto cleanup;
     }
-
-    pmix_err = pmix_hash_table_get_value_ptr(&slurm_jobfields, record_job_data_fields[PRTE_JOB_DATA_JOB_ID],
-                    strlen(record_job_data_fields[PRTE_JOB_DATA_JOB_ID]), (void**)&job_id);
-
-    if(PMIX_SUCCESS != pmix_err) {
-        err = prte_pmix_convert_status(pmix_err);
-        PRTE_ERROR_LOG(err);
-        goto cleanup;
-    }
-
-    if (NULL == trk->request_id && NULL == (trk->request_id = strdup(job_id))) {
-        prte_ras_slurm_kill_job(job_id);
-        err = PRTE_ERR_OUT_OF_RESOURCE;
-        PRTE_ERROR_LOG(err);
-        goto cleanup;
-    }
-
-    err = prte_ras_slurm_add_pending_req(trk->request_id, job_id);
-
-    if(PRTE_SUCCESS != err) {
-        prte_ras_slurm_kill_job(job_id);
-        goto cleanup;
-    }
-
-    trk->pending_added = true;
-
-    /* From here the completion's cancel_pending_req gives the job back */
-    trk->job_id = strdup(job_id);
-
-    if(NULL == trk->job_id) {
-        err = PRTE_ERR_OUT_OF_RESOURCE;
-        PRTE_ERROR_LOG(err);
-        goto cleanup;
-    }
-
-    /* Nothing is asked of Slurm here. salloc holds the handshake until the job
-     * leaves PENDING, so its exit is the notice that there is something to
-     * ask about. */
-    prte_ras_slurm_link_child_to_tracker(job_id, trk->tracker_index);
 
     cleanup:
 

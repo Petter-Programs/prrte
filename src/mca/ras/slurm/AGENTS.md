@@ -245,16 +245,21 @@ The price is that `salloc` is the process holding the handshake with
 slurmctld, and it does not exit until the allocation is granted. Three
 consequences, all in `prte_ras_slurm_exec_salloc`:
 
-- **It is not waited on.** The job ID is read off the child's output — salloc
-  names the job as soon as slurmctld has it, pending or not — and the child is
-  then handed to `prte_wait_cb` and left running. Waiting inline would block
-  the progress thread for the whole queue wait, and PRRTE's own SIGCHLD
-  handler reaps every child anyway.
+- **It is not waited on.** The child is handed to `prte_wait_cb` and left
+  running. Waiting inline would block the progress thread for the whole queue
+  wait, and PRRTE's own SIGCHLD handler reaps every child anyway.
+- **Nor is its job ID.** salloc names the job as soon as slurmctld has it,
+  pending or not. A read event on its pipe (`salloc_output_cb`) scans for that
+  line, and `prte_ras_slurm_salloc_named` carries the extend on from there.
+  On an immediate grant salloc can name the job and exit before the event
+  runs, so the reap scans what is left too; `scanned` makes whichever comes
+  first the only one. A child and its extend match by tracker index and pid.
 - **Killing it while the job is pending revokes the allocation.** That is the
   intended way out of a failed submit, and the reason nothing else may kill it.
 - **Its pipe stays open until it exits.** Closing the read end early would hand
   salloc an `EPIPE` part way through the grant, so the descriptor belongs to
-  the reap callback. Nothing reads it in between, which is only safe because
+  the reap callback. Nothing reads it between the job-ID line and the reap,
+  which is only safe because
   salloc's remaining output is a few hundred bytes — do not add a verbosity
   flag to the command line.
 
@@ -294,6 +299,8 @@ slurmctld, and the progress thread does nothing else while it waits. So every
 `tmpfile()`, reaps the child through
 `prte_wait_cb`, and calls back with the wait status and the file, rewound.
 The JSON window walker reads that file as it read the pipe.
+`salloc` is the one command that outlives its request; its job-ID line is
+read by an event on its own pipe (see above), so it does not block either.
 
 - **`cbdata` is a PMIx object**, retained until the callback returns, so a
   request answered meanwhile (a cancel) cannot free it under the command.
